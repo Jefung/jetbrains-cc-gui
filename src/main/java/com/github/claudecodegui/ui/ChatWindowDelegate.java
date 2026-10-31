@@ -50,6 +50,7 @@ import com.github.claudecodegui.provider.common.MessageCallback;
 import com.github.claudecodegui.provider.common.SDKResult;
 import com.github.claudecodegui.session.SessionLifecycleManager;
 import com.github.claudecodegui.session.StreamMessageCoalescer;
+import com.github.claudecodegui.util.JBCefBrowserFactory;
 import com.github.claudecodegui.util.JsUtils;
 import com.google.gson.JsonObject;
 import com.intellij.ide.util.PropertiesComponent;
@@ -406,7 +407,7 @@ public class ChatWindowDelegate {
         messageDispatcher.registerHandler(new CodexWorkspaceDiffHandler(handlerContext));
 
         messageDispatcher.registerHandler(new WindowEventHandler(handlerContext, new WindowEventHandler.Callback() {
-            @Override public void onHeartbeat(String content) { host.getWebviewWatchdog().handleHeartbeat(content); }
+            @Override public void onHeartbeat(String content) { handleHeartbeat(content); }
             @Override public void onTabLoadingChanged(boolean loading) { updateTabLoadingState(loading); }
             @Override public void onTabStatusChanged(String statusStr) {
                 TabAnswerStatus status;
@@ -623,6 +624,36 @@ public class ChatWindowDelegate {
             });
             return null;
         });
+    }
+
+    /** A resumed Gateway transport may have lost its last transcript or turn-terminal event. */
+    void handleHeartbeat(String content) {
+        boolean resumed = host.getWebviewWatchdog().handleHeartbeat(content);
+        if (!resumed || host.isDisposed() || !host.isFrontendReady()) {
+            return;
+        }
+        JBCefBrowser browser = host.getBrowser();
+        if (browser != null && JBCefBrowserFactory.isRemoteDevelopmentBrowser(browser.getCefBrowser())) {
+            handleRemoteTransportResumed();
+        }
+    }
+
+    /** Reconcile backend state in the existing page so focus, IME composition and drafts survive. */
+    void handleRemoteTransportResumed() {
+        if (host.isDisposed() || !host.isFrontendReady()) {
+            return;
+        }
+        LOG.info("[WebviewTransport] Remote heartbeats resumed; replaying current session state");
+        pushCurrentTabStateToFrontend();
+        host.getPermissionHandler().replayPendingDialogsToWebview();
+        ClaudeSession session = host.getSession();
+        // End an already completed turn before replay: onStreamEnd cancels buffered message
+        // updates in the client. A turn still waiting for its first token must remain loading.
+        if (session != null && !session.isLoading() && !host.getStreamCoalescer().isStreamActive()) {
+            host.callJavaScript("onStreamEnd");
+        }
+        replayCurrentSessionStateToFrontend();
+        host.callJavaScript("window.onTabActivated", "true");
     }
 
     public void handleFrontendReady() {
