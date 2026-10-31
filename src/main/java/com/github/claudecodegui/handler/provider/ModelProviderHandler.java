@@ -550,6 +550,13 @@ public class ModelProviderHandler {
     }
 
     public static int getModelContextLimit(String provider, String model) {
+        if ("opencode".equalsIgnoreCase(provider)) {
+            Integer ocLimit = com.github.claudecodegui.provider.opencode.OpenCodeHistoryReader
+                    .resolveModelContextWindow(model, null);
+            if (ocLimit != null && ocLimit > 0) {
+                return ocLimit;
+            }
+        }
         return CustomModelContextWindowProvider.getInstance()
                 .getContextWindow(provider, model)
                 .orElseGet(() -> getModelContextLimit(model));
@@ -606,6 +613,13 @@ public class ModelProviderHandler {
      * @param cwd session working directory for project-level settings, or null
      */
     public static int resolveContextLimit(String provider, String selectedModel, String cwd) {
+        if ("opencode".equalsIgnoreCase(provider)) {
+            Integer ocLimit = com.github.claudecodegui.provider.opencode.OpenCodeHistoryReader
+                    .resolveModelContextWindow(selectedModel, cwd);
+            if (ocLimit != null && ocLimit > 0) {
+                return ocLimit;
+            }
+        }
         if (!"claude".equalsIgnoreCase(provider)) {
             return getModelContextLimit(provider, selectedModel);
         }

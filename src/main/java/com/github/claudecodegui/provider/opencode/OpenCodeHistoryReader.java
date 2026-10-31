@@ -7,9 +7,11 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import com.google.gson.stream.JsonReader;
 import com.intellij.openapi.diagnostic.Logger;
 
 import java.io.IOException;
+import java.io.StringReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
@@ -344,7 +346,7 @@ public class OpenCodeHistoryReader {
         return null;
     }
 
-    private List<JsonObject> getSessionMessagesFromDatabase(String sessionId) {
+    private List<JsonObject> getSessionMessagesFromDatabase(String sessionId, String cwd) {
         List<JsonObject> out = new ArrayList<>();
         if (databasePath == null || !Files.isRegularFile(databasePath) || !isSafeSessionId(sessionId)) {
             return out;
@@ -353,6 +355,7 @@ public class OpenCodeHistoryReader {
             if (conn == null || !tableExists(conn, "message")) {
                 return out;
             }
+            String effectiveCwd = (cwd != null && !cwd.isBlank()) ? cwd : readSessionDirectoryFromDb(conn, sessionId.trim());
             String sql = """
                     SELECT id, data, time_created
                     FROM message
@@ -391,6 +394,10 @@ public class OpenCodeHistoryReader {
                             );
                             counter += converted.size();
                             out.addAll(converted);
+                            JsonObject usage = extractAssistantUsage(msg, parts, effectiveCwd);
+                            if (usage != null) {
+                                attachUsageToLastAssistantEnvelope(out, usage);
+                            }
                         }
                     }
                 }
@@ -399,6 +406,24 @@ public class OpenCodeHistoryReader {
             LOG.warn("[OpenCodeHistoryReader] SQLite messages failed for " + sessionId + ": " + e.getMessage());
         }
         return out;
+    }
+
+    private String readSessionDirectoryFromDb(Connection conn, String sessionId) {
+        try {
+            if (!tableExists(conn, "session")) {
+                return null;
+            }
+            try (PreparedStatement ps = conn.prepareStatement("SELECT directory FROM session WHERE id = ? LIMIT 1")) {
+                ps.setString(1, sessionId);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (rs.next()) {
+                        return blankToNull(rs.getString("directory"));
+                    }
+                }
+            }
+        } catch (SQLException ignored) {
+        }
+        return null;
     }
 
     private List<JsonObject> loadPartsFromDb(Connection conn, String messageId) throws SQLException {
@@ -629,14 +654,14 @@ public class OpenCodeHistoryReader {
             return List.of();
         }
         // Prefer SQLite rows (OpenCode 1.x). Fall back to legacy JSON tree.
-        List<JsonObject> fromDb = getSessionMessagesFromDatabase(sessionId);
+        List<JsonObject> fromDb = getSessionMessagesFromDatabase(sessionId, cwd);
         if (!fromDb.isEmpty()) {
             return fromDb;
         }
-        return getSessionMessagesFromJsonStorage(sessionId);
+        return getSessionMessagesFromJsonStorage(sessionId, cwd);
     }
 
-    private List<JsonObject> getSessionMessagesFromJsonStorage(String sessionId) throws IOException {
+    private List<JsonObject> getSessionMessagesFromJsonStorage(String sessionId, String cwd) throws IOException {
         Path msgDir = storageRoot.resolve("message").resolve(sessionId.trim());
         if (!Files.isDirectory(msgDir)) {
             LOG.warn("[OpenCodeHistoryReader] Message dir missing for " + sessionId);
@@ -677,9 +702,14 @@ public class OpenCodeHistoryReader {
                 counter++;
                 out.add(buildUserTextMessage(body, messageId != null ? messageId : "oc-user-" + counter));
             } else if ("assistant".equals(role)) {
-                List<JsonObject> converted = convertAssistantParts(messageId, counter, loadPartsFromJson(messageId));
+                List<JsonObject> parts = loadPartsFromJson(messageId);
+                List<JsonObject> converted = convertAssistantParts(messageId, counter, parts);
                 counter += converted.size();
                 out.addAll(converted);
+                JsonObject usage = extractAssistantUsage(msg, parts, cwd);
+                if (usage != null) {
+                    attachUsageToLastAssistantEnvelope(out, usage);
+                }
             }
         }
         return out;
@@ -977,6 +1007,334 @@ public class OpenCodeHistoryReader {
         message.add("content", content);
         root.add("message", message);
         return root;
+    }
+
+    private JsonObject extractAssistantUsage(JsonObject msg, List<JsonObject> parts, String cwd) {
+        JsonObject usage = null;
+        if (msg != null && msg.has("tokens") && msg.get("tokens").isJsonObject()) {
+            usage = convertOpenCodeTokensToUsage(msg.getAsJsonObject("tokens"));
+        }
+        if (usage == null && parts != null) {
+            for (int i = parts.size() - 1; i >= 0; i--) {
+                JsonObject part = parts.get(i);
+                if (part != null && part.has("tokens") && part.get("tokens").isJsonObject()) {
+                    usage = convertOpenCodeTokensToUsage(part.getAsJsonObject("tokens"));
+                    if (usage != null) {
+                        break;
+                    }
+                }
+            }
+        }
+        if (usage == null && msg != null && msg.has("usage") && msg.get("usage").isJsonObject()) {
+            usage = convertOpenAiOrClaudeUsage(msg.getAsJsonObject("usage"));
+        }
+        if (usage == null) {
+            return null;
+        }
+        String model = normalizeOpenCodeModelFromMessage(msg);
+        Integer contextWindow = resolveModelContextWindow(model, cwd, databasePath != null ? databasePath.getParent() : null);
+        if (contextWindow != null && contextWindow > 0 && !usage.has("model_context_window")) {
+            usage.addProperty("model_context_window", contextWindow);
+        }
+        return usage;
+    }
+
+    private static JsonObject convertOpenCodeTokensToUsage(JsonObject tokens) {
+        if (tokens == null) {
+            return null;
+        }
+        int rawInput = Math.max(0, (int) longField(tokens, "input"));
+        int output = Math.max(0, (int) longField(tokens, "output"));
+        int reasoning = Math.max(0, (int) longField(tokens, "reasoning"));
+        int rawTotal = Math.max(0, (int) longField(tokens, "total"));
+        int cacheRead = 0;
+        int cacheWrite = 0;
+        if (tokens.has("cache") && tokens.get("cache").isJsonObject()) {
+            JsonObject cache = tokens.getAsJsonObject("cache");
+            cacheRead = Math.max(0, (int) longField(cache, "read"));
+            cacheWrite = Math.max(0, (int) longField(cache, "write"));
+        } else {
+            cacheRead = Math.max(0, (int) longField(tokens, "cache_read"));
+            cacheWrite = Math.max(0, (int) longField(tokens, "cache_write"));
+        }
+
+        boolean inputIncludesCache = rawTotal > 0
+                && cacheRead > 0
+                && rawInput >= cacheRead
+                && (rawInput + cacheWrite + output + reasoning == rawTotal)
+                && (rawInput + cacheRead + cacheWrite + output + reasoning > rawTotal);
+        int inputTokens = inputIncludesCache ? (rawInput - cacheRead) : rawInput;
+        int totalTokens = rawTotal > 0 ? rawTotal : (inputTokens + cacheRead + cacheWrite + output + reasoning);
+        if (inputTokens <= 0 && output <= 0 && cacheRead <= 0 && cacheWrite <= 0 && totalTokens <= 0) {
+            return null;
+        }
+        JsonObject usage = new JsonObject();
+        usage.addProperty("input_tokens", inputTokens);
+        usage.addProperty("output_tokens", output);
+        usage.addProperty("cache_read_input_tokens", cacheRead);
+        usage.addProperty("cache_creation_input_tokens", cacheWrite);
+        usage.addProperty("total_tokens", totalTokens);
+        if (reasoning > 0) {
+            usage.addProperty("thinking_tokens", reasoning);
+        }
+        return usage;
+    }
+
+    private static JsonObject convertOpenAiOrClaudeUsage(JsonObject rawUsage) {
+        if (rawUsage == null) {
+            return null;
+        }
+        if (rawUsage.has("prompt_tokens") || rawUsage.has("completion_tokens") || rawUsage.has("total_tokens")) {
+            int prompt = Math.max(0, (int) longField(rawUsage, "prompt_tokens"));
+            int completion = Math.max(0, (int) longField(rawUsage, "completion_tokens"));
+            int cached = 0;
+            if (rawUsage.has("prompt_tokens_details") && rawUsage.get("prompt_tokens_details").isJsonObject()) {
+                cached = Math.max(0, (int) longField(rawUsage.getAsJsonObject("prompt_tokens_details"), "cached_tokens"));
+            } else {
+                cached = Math.max(0, (int) longField(rawUsage, "cached_tokens"));
+            }
+            int input = prompt >= cached ? (prompt - cached) : prompt;
+            int total = Math.max(0, (int) longField(rawUsage, "total_tokens"));
+            if (total <= 0) {
+                total = input + cached + completion;
+            }
+            if (input <= 0 && completion <= 0 && cached <= 0 && total <= 0) {
+                return null;
+            }
+            JsonObject usage = new JsonObject();
+            usage.addProperty("input_tokens", input);
+            usage.addProperty("output_tokens", completion);
+            usage.addProperty("cache_read_input_tokens", cached);
+            usage.addProperty("cache_creation_input_tokens", 0);
+            usage.addProperty("total_tokens", total);
+            return usage;
+        }
+        int input = Math.max(0, (int) longField(rawUsage, "input_tokens"));
+        int output = Math.max(0, (int) longField(rawUsage, "output_tokens"));
+        int cacheRead = Math.max(0, (int) longField(rawUsage, "cache_read_input_tokens"));
+        int cacheWrite = Math.max(0, (int) longField(rawUsage, "cache_creation_input_tokens"));
+        int thinking = Math.max(0, (int) longField(rawUsage, "thinking_tokens"));
+        int total = Math.max(0, (int) longField(rawUsage, "total_tokens"));
+        if (total <= 0) {
+            total = input + cacheRead + cacheWrite + output + thinking;
+        }
+        if (input <= 0 && output <= 0 && cacheRead <= 0 && cacheWrite <= 0 && total <= 0) {
+            return null;
+        }
+        JsonObject usage = new JsonObject();
+        usage.addProperty("input_tokens", input);
+        usage.addProperty("output_tokens", output);
+        usage.addProperty("cache_read_input_tokens", cacheRead);
+        usage.addProperty("cache_creation_input_tokens", cacheWrite);
+        usage.addProperty("total_tokens", total);
+        if (thinking > 0) {
+            usage.addProperty("thinking_tokens", thinking);
+        }
+        return usage;
+    }
+
+    private static void attachUsageToLastAssistantEnvelope(List<JsonObject> messages, JsonObject usage) {
+        if (messages == null || usage == null) {
+            return;
+        }
+        for (int i = messages.size() - 1; i >= 0; i--) {
+            JsonObject envelope = messages.get(i);
+            if (envelope != null && "assistant".equals(text(envelope, "type"))) {
+                JsonObject messageObj = envelope.has("message") && envelope.get("message").isJsonObject()
+                        ? envelope.getAsJsonObject("message")
+                        : new JsonObject();
+                messageObj.add("usage", usage.deepCopy());
+                envelope.add("message", messageObj);
+                envelope.add("turnUsage", usage.deepCopy());
+                return;
+            }
+        }
+    }
+
+    /**
+     * Resolve the configured context window ({@code limit.context}) for an OpenCode model
+     * from {@code <cwd>/opencode.json(c)} or {@code ~/.config/opencode/opencode.json(c)}.
+     */
+    public static Integer resolveModelContextWindow(String model, String cwd) {
+        return resolveModelContextWindow(model, cwd, null);
+    }
+
+    static Integer resolveModelContextWindow(String model, String cwd, Path extraConfigDir) {
+        List<Path> candidates = new ArrayList<>();
+        if (cwd != null && !cwd.isBlank()) {
+            try {
+                Path cwdPath = Paths.get(cwd.trim());
+                candidates.add(cwdPath.resolve("opencode.json"));
+                candidates.add(cwdPath.resolve("opencode.jsonc"));
+                candidates.add(cwdPath.resolve(".opencode").resolve("opencode.json"));
+                candidates.add(cwdPath.resolve(".opencode").resolve("opencode.jsonc"));
+            } catch (Exception ignored) {
+            }
+        }
+        if (extraConfigDir != null) {
+            candidates.add(extraConfigDir.resolve("opencode.json"));
+            candidates.add(extraConfigDir.resolve("opencode.jsonc"));
+        }
+        String envConfig = System.getenv("OPENCODE_CONFIG");
+        if (envConfig != null && !envConfig.isBlank()) {
+            try {
+                candidates.add(Paths.get(envConfig.trim()));
+            } catch (Exception ignored) {
+            }
+        }
+        String envConfigDir = System.getenv("OPENCODE_CONFIG_DIR");
+        if (envConfigDir != null && !envConfigDir.isBlank()) {
+            try {
+                Path dir = Paths.get(envConfigDir.trim());
+                candidates.add(dir.resolve("opencode.json"));
+                candidates.add(dir.resolve("opencode.jsonc"));
+                candidates.add(dir.resolve("config.json"));
+            } catch (Exception ignored) {
+            }
+        }
+        try {
+            String xdgConfig = System.getenv("XDG_CONFIG_HOME");
+            Path configBase = (xdgConfig != null && !xdgConfig.isBlank())
+                    ? Paths.get(xdgConfig.trim(), "opencode")
+                    : Paths.get(NodeDetector.resolveHomeForFileOps(), ".config", "opencode");
+            candidates.add(configBase.resolve("opencode.json"));
+            candidates.add(configBase.resolve("opencode.jsonc"));
+            candidates.add(configBase.resolve("config.json"));
+        } catch (Exception ignored) {
+        }
+
+        List<JsonObject> configs = new ArrayList<>();
+        for (Path candidate : candidates) {
+            if (candidate == null || !Files.isRegularFile(candidate)) {
+                continue;
+            }
+            try {
+                String raw = Files.readString(candidate, StandardCharsets.UTF_8);
+                JsonObject parsed = parseLenientObject(raw);
+                if (parsed != null) {
+                    configs.add(parsed);
+                }
+            } catch (Exception ignored) {
+            }
+        }
+        if (configs.isEmpty()) {
+            return null;
+        }
+
+        String effectiveModel = normalizeModelForConfigLookup(model);
+        if (effectiveModel == null) {
+            for (JsonObject cfg : configs) {
+                String defaultModel = normalizeModelForConfigLookup(text(cfg, "model"));
+                if (defaultModel != null) {
+                    effectiveModel = defaultModel;
+                    break;
+                }
+            }
+        }
+        if (effectiveModel == null) {
+            return null;
+        }
+
+        for (JsonObject cfg : configs) {
+            Integer limit = lookupContextLimitInConfig(cfg, effectiveModel);
+            if (limit != null && limit > 0) {
+                return limit;
+            }
+        }
+        return null;
+    }
+
+    private static String normalizeModelForConfigLookup(String model) {
+        if (model == null) {
+            return null;
+        }
+        String trimmed = model.trim();
+        if (trimmed.isEmpty()) {
+            return null;
+        }
+        String lower = trimmed.toLowerCase();
+        if ("__config_default__".equals(lower)
+                || "auto".equals(lower)
+                || "default".equals(lower)
+                || "(default)".equals(lower)
+                || "config-default".equals(lower)
+                || "config_default".equals(lower)
+                || "opencode default".equals(lower)
+                || "opencode-default".equals(lower)) {
+            return null;
+        }
+        return trimmed;
+    }
+
+    private static Integer lookupContextLimitInConfig(JsonObject config, String effectiveModel) {
+        if (config == null || effectiveModel == null || effectiveModel.isBlank()) {
+            return null;
+        }
+        JsonObject providers = null;
+        if (config.has("provider") && config.get("provider").isJsonObject()) {
+            providers = config.getAsJsonObject("provider");
+        } else if (config.has("providers") && config.get("providers").isJsonObject()) {
+            providers = config.getAsJsonObject("providers");
+        }
+        if (providers == null) {
+            return null;
+        }
+
+        int slashIdx = effectiveModel.indexOf('/');
+        String providerId = slashIdx > 0 ? effectiveModel.substring(0, slashIdx) : null;
+        String modelId = slashIdx > 0 ? effectiveModel.substring(slashIdx + 1) : effectiveModel;
+
+        if (providerId != null && providers.has(providerId) && providers.get(providerId).isJsonObject()) {
+            JsonObject prov = providers.getAsJsonObject(providerId);
+            Integer direct = readModelLimitContext(prov, modelId, effectiveModel);
+            if (direct != null && direct > 0) {
+                return direct;
+            }
+        }
+
+        for (Map.Entry<String, JsonElement> entry : providers.entrySet()) {
+            if (entry.getValue() != null && entry.getValue().isJsonObject()) {
+                Integer candidate = readModelLimitContext(entry.getValue().getAsJsonObject(), modelId, effectiveModel);
+                if (candidate != null && candidate > 0) {
+                    return candidate;
+                }
+            }
+        }
+        return null;
+    }
+
+    private static Integer readModelLimitContext(JsonObject providerObj, String modelId, String effectiveModel) {
+        if (providerObj == null || !providerObj.has("models") || !providerObj.get("models").isJsonObject()) {
+            return null;
+        }
+        JsonObject models = providerObj.getAsJsonObject("models");
+        for (String key : new String[]{modelId, effectiveModel}) {
+            if (key == null || !models.has(key) || !models.get(key).isJsonObject()) {
+                continue;
+            }
+            JsonObject modelObj = models.getAsJsonObject(key);
+            if (modelObj.has("limit") && modelObj.get("limit").isJsonObject()) {
+                int ctx = (int) longField(modelObj.getAsJsonObject("limit"), "context");
+                if (ctx > 0) {
+                    return ctx;
+                }
+            }
+        }
+        return null;
+    }
+
+    private static JsonObject parseLenientObject(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return null;
+        }
+        try {
+            JsonReader reader = new JsonReader(new StringReader(raw));
+            reader.setLenient(true);
+            JsonElement el = JsonParser.parseReader(reader);
+            return el != null && el.isJsonObject() ? el.getAsJsonObject() : null;
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     static String normalizePath(String path) {

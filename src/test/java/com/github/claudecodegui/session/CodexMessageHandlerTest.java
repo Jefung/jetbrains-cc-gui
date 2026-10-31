@@ -97,6 +97,7 @@ public class CodexMessageHandlerTest {
         // Records the relative order of stream-end vs message-update callbacks so a
         // test can assert stream-end fires BEFORE the error snapshot is pushed.
         final List<String> callOrder = new ArrayList<>();
+        final List<int[]> usageUpdates = new ArrayList<>();
 
         @Override
         public void onMessageUpdate(List<Message> messages) {
@@ -104,6 +105,11 @@ public class CodexMessageHandlerTest {
             callOrder.add("messageUpdate");
             lastMessages.clear();
             lastMessages.addAll(messages);
+        }
+
+        @Override
+        public void onUsageUpdate(int usedTokens, int maxTokens) {
+            usageUpdates.add(new int[]{usedTokens, maxTokens});
         }
 
         @Override
@@ -827,5 +833,45 @@ public class CodexMessageHandlerTest {
             assertFalse(callback.lastBusy);
             assertFalse(callback.lastLoading);
         }
+    }
+
+    private Message lastAssistantMessage(CodexMessageHandler handler, SessionState state) {
+        List<Message> messages = state.getMessages();
+        for (int i = messages.size() - 1; i >= 0; i--) {
+            if (messages.get(i).type == Message.Type.ASSISTANT) {
+                return messages.get(i);
+            }
+        }
+        return null;
+    }
+
+    @Test
+    public void openCodeUsageMarkerUpdatesContextRingWithTotalTokensAndModelContextWindow() {
+        SessionState state = new SessionState();
+        state.setProvider("opencode");
+        state.setModel("mlx/local/Qwen3-Coder-30B-A3B-Instruct-Ternary2x");
+        CallbackHandler callbackHandler = new CallbackHandler();
+        RecordingCallback callback = new RecordingCallback();
+        callbackHandler.setCallback(callback);
+
+        CodexMessageHandler handler = new CodexMessageHandler(state, callbackHandler);
+        handler.onMessage("stream_start", "");
+        handler.onMessage("content_delta", "Step complete.");
+        handler.onMessage("usage",
+                "{\"input_tokens\":4820,\"output_tokens\":108,\"cache_read_input_tokens\":14189,"
+                        + "\"cache_creation_input_tokens\":0,\"total_tokens\":19117,\"model_context_window\":32768}");
+        handler.onMessage("stream_end", "");
+
+        Message assistant = lastAssistantMessage(handler, state);
+        assertTrue(assistant != null && assistant.raw != null && assistant.raw.has("turnUsage"));
+        JsonObject turnUsage = assistant.raw.getAsJsonObject("turnUsage");
+        assertEquals(4820, turnUsage.get("input_tokens").getAsInt());
+        assertEquals(108, turnUsage.get("output_tokens").getAsInt());
+        assertEquals(14189, turnUsage.get("cache_read_input_tokens").getAsInt());
+        assertEquals(19117, turnUsage.get("total_tokens").getAsInt());
+
+        assertEquals(1, callback.usageUpdates.size());
+        assertEquals(19117, callback.usageUpdates.get(0)[0]);
+        assertEquals(32768, callback.usageUpdates.get(0)[1]);
     }
 }

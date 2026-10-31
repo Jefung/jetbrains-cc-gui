@@ -4,6 +4,7 @@ import com.github.claudecodegui.handler.CodexMessageConverter;
 import com.github.claudecodegui.provider.common.MessageCallback;
 import com.github.claudecodegui.provider.common.SDKResult;
 import com.github.claudecodegui.session.ClaudeSession.Message;
+import com.github.claudecodegui.util.TokenUsageUtils;
 import com.github.claudecodegui.util.UsageCostCalculator;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
@@ -148,6 +149,8 @@ public class CodexMessageHandler implements MessageCallback {
             } else if ("session_id".equals(type)) {
                 // Handle session_id/thread_id (for session recovery)
                 handleSessionId(content);
+            } else if ("usage".equals(type)) {
+                handleUsage(content);
             } else if ("event_msg".equals(type)) {
                 handleEventMessage(content);
             } else if ("stream_start".equals(type)) {
@@ -633,6 +636,87 @@ public class CodexMessageHandler implements MessageCallback {
             }
         }
         return 0;
+    }
+
+    /**
+     * Handle a whole-turn usage marker ([USAGE] → onMessage("usage", json)).
+     *
+     * @param jsonContent canonical usage JSON
+     */
+    private void handleUsage(String jsonContent) {
+        if (jsonContent == null || jsonContent.isEmpty()) {
+            return;
+        }
+        if (!"opencode".equals(state.getProvider()) && !"gemini".equals(state.getProvider())) {
+            LOG.debug("Usage marker dropped (provider '" + state.getProvider()
+                    + "' is not vetted for [USAGE]): " + jsonContent);
+            return;
+        }
+        try {
+            com.google.gson.JsonObject usage = new com.google.gson.Gson().fromJson(jsonContent, com.google.gson.JsonObject.class);
+            if (usage == null || usage.size() == 0 || !hasPositiveDisplayableFigure(usage)) {
+                LOG.debug("Usage marker ignored (no reported figures): " + jsonContent);
+                return;
+            }
+
+            ensureCurrentAssistantMessageExists();
+            Message target = currentAssistantMessage;
+            ensureAssistantMessageRaw(target);
+
+            com.google.gson.JsonObject storedUsage = usage.deepCopy();
+            com.google.gson.JsonObject message = target.raw.getAsJsonObject("message");
+            message.add("usage", storedUsage);
+            target.raw.add("message", message);
+            target.raw.add("turnUsage", usage.deepCopy());
+
+            Double turnCostUsd = UsageCostCalculator.calculateTurnCostUsd(state.getProvider(), usage, state.getModel());
+            if (turnCostUsd != null) {
+                target.raw.addProperty("turnCostUsd", turnCostUsd);
+            }
+
+            int used = TokenUsageUtils.extractContextTokens(usage, state.getProvider());
+            if (used > 0) {
+                int fallbackMax = com.github.claudecodegui.handler.provider.ModelProviderHandler
+                        .resolveContextLimit(state.getProvider(), state.getModel(), state.getCwd());
+                int maxTokens = TokenUsageUtils.extractMaxTokens(usage, fallbackMax);
+                LOG.info("CLI [USAGE] context ring: used=" + used + " max=" + maxTokens
+                        + " model=" + state.getModel());
+                callbackHandler.notifyUsageUpdate(used, maxTokens);
+            }
+            callbackHandler.notifyMessageUpdate(state.getMessages());
+        } catch (Exception e) {
+            LOG.debug("Usage marker parse skipped: " + e.getMessage());
+        }
+    }
+
+    private static boolean hasPositiveDisplayableFigure(com.google.gson.JsonObject usage) {
+        String[] displayableKeys = {
+            "input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens", "total_tokens"
+        };
+        for (String key : displayableKeys) {
+            JsonElement value = usage.get(key);
+            if (value != null && value.isJsonPrimitive() && value.getAsJsonPrimitive().isNumber()) {
+                if (value.getAsLong() > 0) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private static void ensureAssistantMessageRaw(Message message) {
+        if (message.raw == null) {
+            com.google.gson.JsonObject raw = new com.google.gson.JsonObject();
+            raw.addProperty("type", "assistant");
+            com.google.gson.JsonObject messageObj = new com.google.gson.JsonObject();
+            messageObj.add("content", new JsonArray());
+            raw.add("message", messageObj);
+            message.raw = raw;
+        } else if (!message.raw.has("message") || !message.raw.get("message").isJsonObject()) {
+            com.google.gson.JsonObject messageObj = new com.google.gson.JsonObject();
+            messageObj.add("content", new JsonArray());
+            message.raw.add("message", messageObj);
+        }
     }
 
     /**

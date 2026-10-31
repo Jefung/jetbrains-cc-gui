@@ -10,7 +10,9 @@
  * Auth/config comes from OpenCode native config (~/.config/opencode or OPENCODE_HOME).
  */
 
+import { existsSync, readFileSync } from 'fs';
 import { homedir } from 'os';
+import { join } from 'path';
 import { resolveOpenCodeCliPath, enrichPathWithBinDirs, commonCliBinDirs } from '../../utils/cli-path.js';
 import { runCliStreaming } from '../../utils/cli-spawn.js';
 import {
@@ -19,6 +21,7 @@ import {
   emitSessionId,
   emitToolResultMessage,
   emitToolUseMessage,
+  emitUsage,
   isNonEmptySessionId,
   safePromptArg,
 } from '../../utils/marker-protocol.js';
@@ -183,6 +186,132 @@ function parseToolPart(part, sessionId) {
   };
 }
 
+export function extractOpenCodeUsage(event) {
+  if (!event || typeof event !== 'object') return null;
+  const part = event.part && typeof event.part === 'object' ? event.part : null;
+  const tokens = (part?.tokens && typeof part.tokens === 'object' ? part.tokens : null)
+    || (event.tokens && typeof event.tokens === 'object' ? event.tokens : null);
+
+  if (tokens) {
+    const rawInput = Math.max(0, Math.floor(Number(tokens.input) || 0));
+    const output = Math.max(0, Math.floor(Number(tokens.output) || 0));
+    const reasoning = Math.max(0, Math.floor(Number(tokens.reasoning) || 0));
+    const cache = tokens.cache && typeof tokens.cache === 'object' ? tokens.cache : null;
+    const cacheRead = Math.max(0, Math.floor(Number(cache?.read ?? tokens.cache_read ?? tokens.cached) || 0));
+    const cacheWrite = Math.max(0, Math.floor(Number(cache?.write ?? tokens.cache_write) || 0));
+    const rawTotal = Math.max(0, Math.floor(Number(tokens.total) || 0));
+
+    // OpenCode's tokens.input is normally cache-exclusive (total = input + cache.read + cache.write + output + reasoning).
+    // Guard against backends where tokens.input already includes cache.read.
+    const inputIncludesCache = rawTotal > 0
+      && cacheRead > 0
+      && rawInput >= cacheRead
+      && (rawInput + cacheWrite + output + reasoning === rawTotal)
+      && (rawInput + cacheRead + cacheWrite + output + reasoning > rawTotal);
+    const inputTokens = inputIncludesCache ? rawInput - cacheRead : rawInput;
+    const totalTokens = rawTotal > 0
+      ? rawTotal
+      : (inputTokens + cacheRead + cacheWrite + output + reasoning);
+
+    if (inputTokens <= 0 && output <= 0 && cacheRead <= 0 && cacheWrite <= 0 && totalTokens <= 0) {
+      return null;
+    }
+
+    const usage = {
+      input_tokens: inputTokens,
+      output_tokens: output,
+      cache_read_input_tokens: cacheRead,
+      cache_creation_input_tokens: cacheWrite,
+      total_tokens: totalTokens,
+    };
+    if (reasoning > 0) {
+      usage.thinking_tokens = reasoning;
+    }
+    return usage;
+  }
+
+  const rawUsage = (part?.usage && typeof part.usage === 'object' ? part.usage : null)
+    || (event.usage && typeof event.usage === 'object' ? event.usage : null)
+    || (event.message?.usage && typeof event.message.usage === 'object' ? event.message.usage : null);
+  if (!rawUsage) return null;
+
+  if (
+    rawUsage.prompt_tokens !== undefined
+    || rawUsage.completion_tokens !== undefined
+    || rawUsage.total_tokens !== undefined
+  ) {
+    const promptTokens = Math.max(0, Math.floor(Number(rawUsage.prompt_tokens) || 0));
+    const completionTokens = Math.max(0, Math.floor(Number(rawUsage.completion_tokens) || 0));
+    const details = rawUsage.prompt_tokens_details && typeof rawUsage.prompt_tokens_details === 'object'
+      ? rawUsage.prompt_tokens_details
+      : null;
+    const cachedTokens = Math.max(
+      0,
+      Math.floor(Number(details?.cached_tokens ?? rawUsage.cached_tokens ?? rawUsage.cache_read_input_tokens) || 0)
+    );
+    const cacheCreation = Math.max(
+      0,
+      Math.floor(Number(details?.cache_creation_tokens ?? rawUsage.cache_creation_input_tokens) || 0)
+    );
+    const inputTokens = promptTokens >= cachedTokens ? promptTokens - cachedTokens : promptTokens;
+    const totalTokens = Math.max(
+      0,
+      Math.floor(Number(rawUsage.total_tokens) || (inputTokens + cachedTokens + cacheCreation + completionTokens))
+    );
+    if (inputTokens <= 0 && completionTokens <= 0 && cachedTokens <= 0 && cacheCreation <= 0 && totalTokens <= 0) {
+      return null;
+    }
+    const usage = {
+      input_tokens: inputTokens,
+      output_tokens: completionTokens,
+      cache_read_input_tokens: cachedTokens,
+      cache_creation_input_tokens: cacheCreation,
+      total_tokens: totalTokens,
+    };
+    const reasoningTokens = Math.max(
+      0,
+      Math.floor(Number(rawUsage.completion_tokens_details?.reasoning_tokens ?? rawUsage.thinking_tokens) || 0)
+    );
+    if (reasoningTokens > 0) {
+      usage.thinking_tokens = reasoningTokens;
+    }
+    return usage;
+  }
+
+  if (
+    rawUsage.input_tokens !== undefined
+    || rawUsage.output_tokens !== undefined
+    || rawUsage.cache_read_input_tokens !== undefined
+    || rawUsage.cache_creation_input_tokens !== undefined
+  ) {
+    const inputTokens = Math.max(0, Math.floor(Number(rawUsage.input_tokens) || 0));
+    const outputTokens = Math.max(0, Math.floor(Number(rawUsage.output_tokens) || 0));
+    const cacheRead = Math.max(0, Math.floor(Number(rawUsage.cache_read_input_tokens) || 0));
+    const cacheCreation = Math.max(0, Math.floor(Number(rawUsage.cache_creation_input_tokens) || 0));
+    const thinkingTokens = Math.max(0, Math.floor(Number(rawUsage.thinking_tokens) || 0));
+    const totalTokens = Math.max(
+      0,
+      Math.floor(Number(rawUsage.total_tokens) || (inputTokens + cacheRead + cacheCreation + outputTokens + thinkingTokens))
+    );
+    if (inputTokens <= 0 && outputTokens <= 0 && cacheRead <= 0 && cacheCreation <= 0 && totalTokens <= 0) {
+      return null;
+    }
+    const usage = {
+      input_tokens: inputTokens,
+      output_tokens: outputTokens,
+      cache_read_input_tokens: cacheRead,
+      cache_creation_input_tokens: cacheCreation,
+      total_tokens: totalTokens,
+    };
+    if (thinkingTokens > 0) {
+      usage.thinking_tokens = thinkingTokens;
+    }
+    return usage;
+  }
+
+  return null;
+}
+
 export function parseOpenCodeEvent(line) {
   if (!line || !line.trim()) return { kind: 'other' };
   let event;
@@ -203,8 +332,8 @@ export function parseOpenCodeEvent(line) {
   }
 
   // OpenCode 1.x wraps content in event.part and types it there (text /
-  // reasoning / tool). part.type is authoritative when present; the legacy
-  // top-level matching further down stays as a fallback for older shapes.
+  // reasoning / tool / step-finish). part.type is authoritative when present;
+  // the legacy top-level matching further down stays as a fallback for older shapes.
   const part = event.part && typeof event.part === 'object' ? event.part : null;
   const partType = typeof part?.type === 'string' ? part.type.toLowerCase() : '';
 
@@ -218,6 +347,19 @@ export function parseOpenCodeEvent(line) {
   }
   if (partType === 'tool') {
     return parseToolPart(part, sessionId);
+  }
+  if (
+    partType === 'step-finish'
+    || partType === 'step_finish'
+    || lower === 'step_finish'
+    || lower === 'step-finish'
+    || lower === 'usage'
+  ) {
+    const usage = extractOpenCodeUsage(event);
+    if (usage) {
+      return { kind: 'usage', usage, sessionId };
+    }
+    return sessionId ? { kind: 'session', sessionId } : { kind: 'other' };
   }
 
   if (
@@ -294,6 +436,11 @@ export function parseOpenCodeEvent(line) {
     };
   }
 
+  const fallbackUsage = extractOpenCodeUsage(event);
+  if (fallbackUsage) {
+    return { kind: 'usage', usage: fallbackUsage, sessionId };
+  }
+
   if (sessionId) {
     return { kind: 'session', sessionId };
   }
@@ -322,7 +469,7 @@ function novelDelta(stateMap, partId, fullText) {
  * two-phase kinds (tool_use / tool_result) keep their old behavior; the
  * started-dedup makes both shapes converge on one tool_use per id.
  *
- * @param {object} sink marker emitters: contentDelta/thinkingDelta/toolUse/toolResult/sendError
+ * @param {object} sink marker emitters: contentDelta/thinkingDelta/toolUse/toolResult/usage/sendError
  * @returns {(event: object) => void} dispatcher over parseOpenCodeEvent output
  */
 export function createOpenCodeEventDispatcher(sink) {
@@ -365,6 +512,9 @@ export function createOpenCodeEventDispatcher(sink) {
       case 'tool_result':
         sink.toolResult({ toolUseId: event.toolCallId, content: event.content, isError: event.isError });
         break;
+      case 'usage':
+        sink.usage?.(event.usage);
+        break;
       case 'error':
         sink.sendError(event.message);
         break;
@@ -372,6 +522,141 @@ export function createOpenCodeEventDispatcher(sink) {
         break;
     }
   };
+}
+
+function stripJsonComments(raw) {
+  if (typeof raw !== 'string') return '';
+  let out = '';
+  let inString = false;
+  let escape = false;
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i];
+    const next = raw[i + 1];
+    if (inString) {
+      out += ch;
+      if (escape) {
+        escape = false;
+      } else if (ch === '\\') {
+        escape = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      out += ch;
+      continue;
+    }
+    if (ch === '/' && next === '/') {
+      while (i < raw.length && raw[i] !== '\n') i++;
+      if (i < raw.length) out += '\n';
+      continue;
+    }
+    if (ch === '/' && next === '*') {
+      i += 2;
+      while (i < raw.length && !(raw[i] === '*' && raw[i + 1] === '/')) i++;
+      i++;
+      continue;
+    }
+    out += ch;
+  }
+  return out.replace(/,\s*([}\]])/g, '$1');
+}
+
+function lookupContextLimitInConfig(config, effectiveModel) {
+  if (!config || typeof config !== 'object' || !effectiveModel) return null;
+  const providers = config.provider && typeof config.provider === 'object'
+    ? config.provider
+    : (config.providers && typeof config.providers === 'object' ? config.providers : null);
+  if (!providers) return null;
+
+  const slashIdx = effectiveModel.indexOf('/');
+  const providerId = slashIdx > 0 ? effectiveModel.slice(0, slashIdx) : null;
+  const modelId = slashIdx > 0 ? effectiveModel.slice(slashIdx + 1) : effectiveModel;
+
+  if (providerId && providers[providerId]?.models) {
+    const models = providers[providerId].models;
+    const direct = models[modelId]?.limit?.context ?? models[effectiveModel]?.limit?.context;
+    const num = Math.floor(Number(direct) || 0);
+    if (num > 0) return num;
+  }
+
+  for (const prov of Object.values(providers)) {
+    const models = prov && typeof prov === 'object' ? prov.models : null;
+    if (!models || typeof models !== 'object') continue;
+    const candidate = models[effectiveModel]?.limit?.context ?? models[modelId]?.limit?.context;
+    const num = Math.floor(Number(candidate) || 0);
+    if (num > 0) return num;
+  }
+  return null;
+}
+
+/**
+ * Resolve the configured context window (`limit.context`) for an OpenCode model
+ * from `<cwd>/opencode.json(c)` or `~/.config/opencode/opencode.json(c)`.
+ */
+export function resolveOpenCodeContextWindow(model, cwd = '', home = '') {
+  const effectiveHome = home || process.env.HOME || process.env.USERPROFILE || homedir();
+  const candidates = [];
+  if (cwd && cwd !== 'undefined' && cwd !== 'null') {
+    candidates.push(
+      join(cwd, 'opencode.json'),
+      join(cwd, 'opencode.jsonc'),
+      join(cwd, '.opencode', 'opencode.json'),
+      join(cwd, '.opencode', 'opencode.jsonc')
+    );
+  }
+  if (process.env.OPENCODE_CONFIG) {
+    candidates.push(process.env.OPENCODE_CONFIG);
+  }
+  if (process.env.OPENCODE_CONFIG_DIR) {
+    candidates.push(
+      join(process.env.OPENCODE_CONFIG_DIR, 'opencode.json'),
+      join(process.env.OPENCODE_CONFIG_DIR, 'opencode.jsonc'),
+      join(process.env.OPENCODE_CONFIG_DIR, 'config.json')
+    );
+  }
+  const xdgConfig = process.env.XDG_CONFIG_HOME || (effectiveHome ? join(effectiveHome, '.config') : '');
+  if (xdgConfig) {
+    candidates.push(
+      join(xdgConfig, 'opencode', 'opencode.json'),
+      join(xdgConfig, 'opencode', 'opencode.jsonc'),
+      join(xdgConfig, 'opencode', 'config.json')
+    );
+  }
+
+  const parsedConfigs = [];
+  for (const filePath of candidates) {
+    try {
+      if (!filePath || !existsSync(filePath)) continue;
+      const raw = readFileSync(filePath, 'utf8');
+      const parsed = JSON.parse(stripJsonComments(raw));
+      if (parsed && typeof parsed === 'object') {
+        parsedConfigs.push(parsed);
+      }
+    } catch {
+      // Ignore unreadable or malformed config files.
+    }
+  }
+  if (parsedConfigs.length === 0) return null;
+
+  let effectiveModel = resolveModelFlag(model);
+  if (!effectiveModel) {
+    for (const cfg of parsedConfigs) {
+      if (typeof cfg.model === 'string' && cfg.model.trim()) {
+        effectiveModel = cfg.model.trim();
+        break;
+      }
+    }
+  }
+  if (!effectiveModel) return null;
+
+  for (const cfg of parsedConfigs) {
+    const limit = lookupContextLimitInConfig(cfg, effectiveModel);
+    if (limit && limit > 0) return limit;
+  }
+  return null;
 }
 
 function resolveModelFlag(model) {
@@ -500,11 +785,19 @@ export async function sendMessage(
   enrichPathWithBinDirs(env, commonCliBinDirs(home));
 
   const workCwd = cwd && cwd !== 'undefined' && cwd !== 'null' ? cwd : process.cwd();
+  const modelContextWindow = resolveOpenCodeContextWindow(model, workCwd, home);
   const dispatch = createOpenCodeEventDispatcher({
     contentDelta: (text) => emitJsonStringMarker('[CONTENT_DELTA]', text),
     thinkingDelta: (text) => emitJsonStringMarker('[THINKING_DELTA]', text),
     toolUse: emitToolUseMessage,
     toolResult: emitToolResultMessage,
+    usage: (usage) => {
+      if (!usage || typeof usage !== 'object') return;
+      const payload = modelContextWindow && modelContextWindow > 0 && !usage.model_context_window
+        ? { ...usage, model_context_window: modelContextWindow }
+        : usage;
+      emitUsage(payload);
+    },
     sendError: (errorMessage) =>
       console.log(`[SEND_ERROR] ${JSON.stringify({ error: errorMessage })}`),
   });
