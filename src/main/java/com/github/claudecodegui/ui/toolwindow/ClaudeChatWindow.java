@@ -507,6 +507,7 @@ public class ClaudeChatWindow {
             }
 
             persistTabSessionState();
+            chatWindowDelegate.refreshUnreadBadge();
         }
     }
 
@@ -681,6 +682,7 @@ public class ClaudeChatWindow {
                 return;
             }
             ensureWebviewInitialized(false);
+            chatWindowDelegate.markTabReadIfVisible();
             webviewWatchdog.markTabActivated();
             webviewInitializer.onTabActivated();
             JBCefBrowser currentBrowser = browser;
@@ -1322,6 +1324,7 @@ public class ClaudeChatWindow {
         }
         rebindSurfaceRefreshWindow();
         if (mainPanel.isShowing()) {
+            chatWindowDelegate.markTabReadIfVisible();
             ensureWebviewInitialized(false);
             resumePendingSurfaceWork("hierarchy_showing");
         }
@@ -1658,6 +1661,7 @@ public class ClaudeChatWindow {
                     + (project != null ? project.getBasePath() : null));
         }
         session.setSessionInfo(restoredSessionId, restoredCwd);
+        chatWindowDelegate.restoreUnread(sameProject && savedState.unread);
         persistTabSessionState();
 
         LOG.info("[TabRestore] Restored tab session state: provider=" + savedState.provider
@@ -2435,6 +2439,13 @@ public class ClaudeChatWindow {
                 streamCoalescer,
                 new SessionCallbackAdapter.JsTarget() {
                     @Override
+                    public void onAssistantActivity() {
+                        if (!disposed && session == callbackSession) {
+                            chatWindowDelegate.onAssistantActivity();
+                        }
+                    }
+
+                    @Override
                     public void callJavaScript(String functionName, String... args) {
                         ClaudeChatWindow.this.callJavaScript(functionName, args);
                     }
@@ -2933,6 +2944,7 @@ public class ClaudeChatWindow {
         snapshot.model = session.getModel();
         snapshot.permissionMode = session.getPermissionMode();
         snapshot.reasoningEffort = session.getReasoningEffort();
+        snapshot.unread = chatWindowDelegate.hasUnread();
 
         TabStateService.getInstance(project).saveTabSessionState(tabIndex, snapshot);
     }

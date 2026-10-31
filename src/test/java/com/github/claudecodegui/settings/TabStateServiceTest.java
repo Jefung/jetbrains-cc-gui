@@ -4,8 +4,25 @@ import com.intellij.util.xmlb.XmlSerializer;
 import org.junit.Test;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 
 public class TabStateServiceTest {
+    /** Unread belongs to a session snapshot and survives copying and project XML reload. */
+    @Test
+    public void preservesUnreadAcrossSnapshotCopiesAndProjectRestart() {
+        TabStateService service = new TabStateService();
+        TabStateService.TabSessionState session = new TabStateService.TabSessionState();
+        session.sessionId = "unread-session";
+        session.unread = true;
+        service.saveTabSessionState(0, session);
+        session.unread = false;
+        assertTrue(service.getTabSessionState(0).unread);
+        TabStateService restored = new TabStateService();
+        restored.loadState(XmlSerializer.deserialize(
+                XmlSerializer.serialize(service.getState()), TabStateService.State.class));
+        assertTrue(restored.getTabSessionState(0).unread);
+    }
+
     /** Existing installations have no selected index and keep the first-tab fallback. */
     @Test
     public void legacyStateDefaultsToTheFirstTab() {

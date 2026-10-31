@@ -57,6 +57,8 @@ import com.intellij.ide.util.PropertiesComponent;
 import com.intellij.openapi.application.ApplicationManager;
 import com.intellij.openapi.diagnostic.Logger;
 import com.intellij.openapi.project.Project;
+import com.intellij.openapi.util.IconLoader;
+import com.intellij.openapi.wm.ToolWindow;
 import com.intellij.ui.content.Content;
 import com.intellij.ui.jcef.JBCefBrowser;
 import com.intellij.util.concurrency.AppExecutorUtil;
@@ -65,6 +67,8 @@ import javax.swing.*;
 import java.util.List;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 
 /**
  * Delegates for initialization setup and runtime operations:
@@ -144,6 +148,13 @@ public class ChatWindowDelegate {
     }
 
     private final DelegateHost host;
+    private final Consumer<Runnable> unreadUiScheduler;
+    private final AtomicBoolean unreadUpdateQueued = new AtomicBoolean();
+    private volatile boolean unread;
+    private Content unreadBadgeContent;
+    private Icon previousTabIcon;
+    private Boolean previousIconVisibility;
+    private Icon unreadIcon;
     private TabAnswerStatus currentTabStatus = TabAnswerStatus.IDLE;
     private ScheduledFuture<?> statusResetTask;
     private volatile String pendingQuickFixPrompt = null;
@@ -153,7 +164,85 @@ public class ChatWindowDelegate {
     private volatile ClipboardHandler clipboardHandler;
 
     public ChatWindowDelegate(DelegateHost host) {
+        this(host, runnable -> ApplicationManager.getApplication().invokeLater(runnable));
+    }
+
+    ChatWindowDelegate(DelegateHost host, Consumer<Runnable> unreadUiScheduler) {
         this.host = host;
+        this.unreadUiScheduler = unreadUiScheduler;
+    }
+
+    public boolean hasUnread() {
+        return unread;
+    }
+
+    /** Coalesce streaming notifications; already-unread tabs do no additional EDT work. */
+    public void onAssistantActivity() {
+        if (host.isDisposed() || unread || !unreadUpdateQueued.compareAndSet(false, true)) {
+            return;
+        }
+        unreadUiScheduler.accept(() -> {
+            unreadUpdateQueued.set(false);
+            if (host.isDisposed() || isChatVisibleForReading() || unread) {
+                return;
+            }
+            unread = true;
+            renderUnreadBadge();
+            host.persistTabSessionState();
+        });
+    }
+
+    private boolean isChatVisibleForReading() {
+        return host.isFrontendReady() && host.isActiveContent() && host.getMainPanel().isShowing();
+    }
+
+    /** Selection alone is insufficient while a hidden or reloading page cannot show the reply. */
+    public void markTabReadIfVisible() {
+        if (!unread) {
+            return;
+        }
+        unreadUiScheduler.accept(() -> {
+            if (!host.isDisposed() && unread && isChatVisibleForReading()) {
+                unread = false;
+                renderUnreadBadge();
+                host.persistTabSessionState();
+            }
+        });
+    }
+
+    public void restoreUnread(boolean savedUnread) {
+        unread = savedUnread;
+        refreshUnreadBadge();
+    }
+
+    public void refreshUnreadBadge() {
+        unreadUiScheduler.accept(() -> {
+            if (!host.isDisposed()) {
+                renderUnreadBadge();
+            }
+        });
+    }
+
+    /** Restore the original icon on read and transfer the badge when Content is reattached. */
+    private void renderUnreadBadge() {
+        Content content = host.getParentContent();
+        if (unreadBadgeContent != null && (!unread || unreadBadgeContent != content)) {
+            if (unreadBadgeContent.getIcon() == unreadIcon) {
+                unreadBadgeContent.setIcon(previousTabIcon);
+                unreadBadgeContent.putUserData(ToolWindow.SHOW_CONTENT_ICON, previousIconVisibility);
+            }
+            unreadBadgeContent = null;
+        }
+        if (unread && content != null && unreadBadgeContent == null) {
+            if (unreadIcon == null) {
+                unreadIcon = IconLoader.getIcon("/icons/unread-dot.svg", ChatWindowDelegate.class);
+            }
+            previousTabIcon = content.getIcon();
+            previousIconVisibility = content.getUserData(ToolWindow.SHOW_CONTENT_ICON);
+            unreadBadgeContent = content;
+            content.setIcon(unreadIcon);
+            content.putUserData(ToolWindow.SHOW_CONTENT_ICON, true);
+        }
     }
 
     private void applyNodePathToBridges(String path) {
@@ -664,6 +753,7 @@ public class ChatWindowDelegate {
         boolean runtimeRecovery = host.isRuntimeRecoveryPage() || host.isFrontendReady();
         host.setFrontendReady(true);
         host.getWebviewWatchdog().markFrontendReady();
+        markTabReadIfVisible();
 
         host.callJavaScript(
             "window.updateLinkifyCapabilities",
