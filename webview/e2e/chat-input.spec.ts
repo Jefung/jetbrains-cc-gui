@@ -142,6 +142,21 @@ async function submitCodexCompact(page: Page) {
   await editable.press('Enter');
 }
 
+test('opening a chat never auto-opens release notes and the version tag still opens them', async ({ page }, testInfo) => {
+  await page.addInitScript(() => localStorage.setItem('lastSeenChangelogVersion', '0.0.1'));
+  await page.reload();
+  await expect(page.locator('.input-editable')).toBeVisible();
+  await expect(page.locator('.changelog-overlay')).toHaveCount(0);
+  await page.locator('.version-tag').click();
+  await expect(page.locator('.changelog-dialog')).toBeVisible();
+  await page.locator('.changelog-close-btn').click();
+  await expect(page.locator('.changelog-overlay')).toHaveCount(0);
+  await page.reload();
+  await expect(page.locator('.input-editable')).toBeVisible();
+  await expect(page.locator('.changelog-overlay')).toHaveCount(0);
+  await page.screenshot({ path: testInfo.outputPath('chat-without-release-notes.png') });
+});
+
 test('Enter sends once and a held key cannot submit the next draft', async ({ page }) => {
   const editable = page.locator('.input-editable');
   await editable.fill('first message');

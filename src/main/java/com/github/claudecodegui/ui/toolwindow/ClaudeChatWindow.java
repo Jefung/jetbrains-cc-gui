@@ -525,6 +525,24 @@ public class ClaudeChatWindow {
         return initialWebviewStartup.hasStarted();
     }
 
+    /** Let the visible tab finish restoring history before background work competes with it. */
+    boolean isReadyForBackgroundPreload() {
+        return frontendReady && (session == null || !session.isLoading());
+    }
+
+    /** Warm restored pages and disk history without selecting the tab or starting an AI turn. */
+    void preloadRestoredTab() {
+        if (disposed || project.isDisposed()) {
+            return;
+        }
+        ensureWebviewInitialized();
+        if (session != null) {
+            TabStateService.TabSessionState state = new TabStateService.TabSessionState();
+            state.sessionId = session.getSessionId();
+            loadRestoredHistoryIfNeeded(state, true);
+        }
+    }
+
     private void ensureWebviewInitialized() {
         ensureWebviewInitialized(true);
     }
@@ -1665,7 +1683,12 @@ public class ClaudeChatWindow {
     }
 
     private void loadRestoredHistoryIfNeeded(TabStateService.TabSessionState savedState) {
-        if (!TabSessionRestorePolicy.shouldStartHistoryLoad(savedState, frontendReady)
+        loadRestoredHistoryIfNeeded(savedState, false);
+    }
+
+    /** Background pages may defer rendering; their history can still be ready before activation. */
+    private void loadRestoredHistoryIfNeeded(TabStateService.TabSessionState savedState, boolean preload) {
+        if (!TabSessionRestorePolicy.shouldStartHistoryLoad(savedState, frontendReady || preload)
                 || session == null || !isNonEmpty(session.getSessionId())) {
             return;
         }
