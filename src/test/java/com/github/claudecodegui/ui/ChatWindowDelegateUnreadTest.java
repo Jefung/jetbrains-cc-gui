@@ -25,13 +25,19 @@ import static org.junit.Assert.*;
 public class ChatWindowDelegateUnreadTest {
     private static final class Tab {
         final AtomicReference<Icon> icon = new AtomicReference<>();
+        /** Like the platform tab label, setIcon repaints and reads SHOW_CONTENT_ICON only then. */
+        final AtomicReference<Icon> painted = new AtomicReference<>();
         final AtomicReference<String> name = new AtomicReference<>("AI test");
         final Map<Key<?>, Object> data = new HashMap<>();
         final Content content = (Content) Proxy.newProxyInstance(Content.class.getClassLoader(),
                 new Class<?>[]{Content.class}, (proxy, method, args) -> {
                     switch (method.getName()) {
                         case "getIcon": return icon.get();
-                        case "setIcon": icon.set((Icon) args[0]); return null;
+                        case "setIcon":
+                            icon.set((Icon) args[0]);
+                            painted.set(Boolean.TRUE.equals(data.get(ToolWindow.SHOW_CONTENT_ICON))
+                                    ? (Icon) args[0] : null);
+                            return null;
                         case "getUserData": return data.get(args[0]);
                         case "putUserData": data.put((Key<?>) args[0], args[1]); return null;
                         case "getDisplayName": return name.get();
@@ -83,6 +89,17 @@ public class ChatWindowDelegateUnreadTest {
         for (int i = 0; i < 100; i++) f.delegate.onAssistantActivity();
         assertTrue(f.queue.isEmpty());
         assertEquals(1, f.saves.get());
+    }
+
+    @Test
+    public void badgeIsPaintedWhenSetAndTheHiddenIconStaysHiddenWhenCleared() {
+        Fixture f = new Fixture();
+        f.tab.get().icon.set(new ImageIcon(new BufferedImage(16, 16, BufferedImage.TYPE_INT_ARGB)));
+        f.delegate.onAssistantActivity(); f.drain();
+        assertNotNull(f.tab.get().painted.get());
+        f.selected.set(true);
+        f.delegate.markTabReadIfVisible(); f.drain();
+        assertNull(f.tab.get().painted.get());
     }
 
     @Test

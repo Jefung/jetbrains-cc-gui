@@ -225,13 +225,17 @@ public class ChatWindowDelegate {
         });
     }
 
-    /** Restore the original icon on read and transfer the badge when Content is reattached. */
+    /**
+     * Restore the original icon on read and transfer the badge when Content is reattached.
+     * The tab label repaints on setIcon and reads SHOW_CONTENT_ICON only then, so the flag is
+     * always written first.
+     */
     private void renderUnreadBadge() {
         Content content = host.getParentContent();
         if (unreadBadgeContent != null && (!unread || unreadBadgeContent != content)) {
             if (unreadBadgeContent.getIcon() == unreadIcon) {
-                unreadBadgeContent.setIcon(previousTabIcon);
                 unreadBadgeContent.putUserData(ToolWindow.SHOW_CONTENT_ICON, previousIconVisibility);
+                unreadBadgeContent.setIcon(previousTabIcon);
             }
             unreadBadgeContent = null;
         }
@@ -242,8 +246,8 @@ public class ChatWindowDelegate {
             previousTabIcon = content.getIcon();
             previousIconVisibility = content.getUserData(ToolWindow.SHOW_CONTENT_ICON);
             unreadBadgeContent = content;
-            content.setIcon(unreadIcon);
             content.putUserData(ToolWindow.SHOW_CONTENT_ICON, true);
+            content.setIcon(unreadIcon);
         }
     }
 
