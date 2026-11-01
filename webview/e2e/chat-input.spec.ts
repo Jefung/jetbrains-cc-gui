@@ -326,7 +326,7 @@ test('a stalled draft store does not keep the chat blank', async ({ page }) => {
   await expect.poll(() => sentMessages(page)).toEqual(['typed after the restore timeout']);
 });
 
-test('remote tab repaint preserves input selection and IME composition without changing zoom', async ({ page }) => {
+test('remote and generic repaints preserve editing selection and IME composition without changing zoom', async ({ page }, testInfo) => {
   const input = page.locator('.input-editable');
   await input.fill('中文 English');
   const initial = await input.evaluate((element) => {
@@ -343,6 +343,11 @@ test('remote tab repaint preserves input selection and IME composition without c
     for (let count = 0; count < 5; count++) window.onTabActivated?.(true);
     return snapshot;
   });
+  await page.evaluate(async () => {
+    const modulePath = '/src/utils/forceWebviewRepaint.ts';
+    const { forceWebviewRepaint } = await import(modulePath);
+    await new Promise<void>((resolve) => forceWebviewRepaint('editing-regression', resolve));
+  });
   await expect(page.locator('#ccgui-remote-repaint')).toHaveCount(0);
   expect(await input.evaluate((element) => ({
     text: element.textContent,
@@ -350,9 +355,18 @@ test('remote tab repaint preserves input selection and IME composition without c
     offset: getSelection()!.anchorOffset,
   }))).toEqual(initial);
   await expect(input).toBeFocused();
+  expect(await input.evaluate((element) => getComputedStyle(element).backgroundColor))
+    .not.toBe('rgba(0, 0, 0, 0)');
   await input.dispatchEvent('compositionend', { data: '中文' });
   await page.keyboard.insertText('测试');
   await expect(input).toHaveText('中文测试 English');
+  await input.press('End');
+  await input.press('ArrowLeft');
+  await input.press('Backspace');
+  await page.keyboard.insertText('_');
+  await expect(input).toHaveText('中文测试 Engli_h');
+  expect(await input.evaluate(() => getSelection()!.rangeCount)).toBe(1);
+  await page.screenshot({ path: testInfo.outputPath('editing-after-repaint.png') });
   expect(await sentMessages(page)).toEqual([]);
 });
 
