@@ -8,6 +8,7 @@ import com.github.claudecodegui.session.SessionState;
 import com.github.claudecodegui.skill.SlashCommandRegistry;
 import com.github.claudecodegui.provider.ClaudeContextWindowOverrideProvider;
 import com.github.claudecodegui.provider.CustomModelContextWindowProvider;
+import com.github.claudecodegui.provider.opencode.OpenCodeContextWindowResolver;
 import com.github.claudecodegui.util.EditorFileUtils;
 import com.github.claudecodegui.util.TokenUsageUtils;
 import com.google.gson.Gson;
@@ -164,7 +165,7 @@ public class ModelProviderHandler {
                     : model;
             int newMaxTokens = isClaude
                     ? getClaudeContextLimit(resolvedModelForUsage, sessionCwd(context))
-                    : getModelContextLimit(provider, model);
+                    : providerContextLimit(provider, model, sessionCwd(context));
             LOG.info("[ModelProviderHandler] Model context limit: " + newMaxTokens
                     + " tokens for selected model: " + model
                     + ", resolved model: " + resolvedModelForUsage);
@@ -550,11 +551,18 @@ public class ModelProviderHandler {
     }
 
     public static int getModelContextLimit(String provider, String model) {
+        return providerContextLimit(provider, model, null);
+    }
+
+    /**
+     * Non-Claude context window: OpenCode's own {@code limit.context} (project config
+     * when {@code cwd} is known), then the custom window table, then the static table.
+     */
+    private static int providerContextLimit(String provider, String model, String cwd) {
         if ("opencode".equalsIgnoreCase(provider)) {
-            Integer ocLimit = com.github.claudecodegui.provider.opencode.OpenCodeHistoryReader
-                    .resolveModelContextWindow(model, null);
-            if (ocLimit != null && ocLimit > 0) {
-                return ocLimit;
+            Integer declared = OpenCodeContextWindowResolver.resolve(model, cwd);
+            if (declared != null) {
+                return declared;
             }
         }
         return CustomModelContextWindowProvider.getInstance()
@@ -613,15 +621,8 @@ public class ModelProviderHandler {
      * @param cwd session working directory for project-level settings, or null
      */
     public static int resolveContextLimit(String provider, String selectedModel, String cwd) {
-        if ("opencode".equalsIgnoreCase(provider)) {
-            Integer ocLimit = com.github.claudecodegui.provider.opencode.OpenCodeHistoryReader
-                    .resolveModelContextWindow(selectedModel, cwd);
-            if (ocLimit != null && ocLimit > 0) {
-                return ocLimit;
-            }
-        }
         if (!"claude".equalsIgnoreCase(provider)) {
-            return getModelContextLimit(provider, selectedModel);
+            return providerContextLimit(provider, selectedModel, cwd);
         }
         JsonObject env = ClaudeContextWindowOverrideProvider.getInstance().getUserSettingsEnv();
         String cliModel = env == null ? selectedModel : resolveConfiguredClaudeModel(selectedModel, env);

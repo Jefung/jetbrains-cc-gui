@@ -5,6 +5,7 @@ import com.github.claudecodegui.provider.common.MessageCallback;
 import com.github.claudecodegui.provider.common.SDKResult;
 import com.github.claudecodegui.session.ClaudeSession.Message;
 import com.github.claudecodegui.util.TokenUsageUtils;
+import com.github.claudecodegui.util.TurnUsageAccumulator;
 import com.github.claudecodegui.util.UsageCostCalculator;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
@@ -78,6 +79,10 @@ public class CodexMessageHandler implements MessageCallback {
     private boolean streamEndedThisTurn = false;
 
     private com.google.gson.JsonObject currentTurnContextUsage;
+
+    /** Running whole-turn total of per-step [USAGE] markers, and the message showing it. */
+    private final TurnUsageAccumulator stepTurnUsage = new TurnUsageAccumulator();
+    private Message stepTurnUsageTarget;
 
     /**
      * Constructor.
@@ -639,7 +644,11 @@ public class CodexMessageHandler implements MessageCallback {
     }
 
     /**
-     * Handle a whole-turn usage marker ([USAGE] → onMessage("usage", json)).
+     * Handle a per-step usage marker ([USAGE] → onMessage("usage", json)).
+     *
+     * <p>OpenCode emits one marker per model step. The latest step is the current
+     * context snapshot ({@code message.usage}, read by the context ring); the steps
+     * of a turn are summed into {@code turnUsage} for the message footer.</p>
      *
      * @param jsonContent canonical usage JSON
      */
@@ -647,46 +656,60 @@ public class CodexMessageHandler implements MessageCallback {
         if (jsonContent == null || jsonContent.isEmpty()) {
             return;
         }
-        if (!"opencode".equals(state.getProvider()) && !"gemini".equals(state.getProvider())) {
+        if (!"opencode".equals(state.getProvider())) {
             LOG.debug("Usage marker dropped (provider '" + state.getProvider()
                     + "' is not vetted for [USAGE]): " + jsonContent);
             return;
         }
         try {
             com.google.gson.JsonObject usage = new com.google.gson.Gson().fromJson(jsonContent, com.google.gson.JsonObject.class);
-            if (usage == null || usage.size() == 0 || !hasPositiveDisplayableFigure(usage)) {
+            if (usage == null || !hasPositiveDisplayableFigure(usage)) {
                 LOG.debug("Usage marker ignored (no reported figures): " + jsonContent);
                 return;
             }
 
             ensureCurrentAssistantMessageExists();
             Message target = currentAssistantMessage;
-            ensureAssistantMessageRaw(target);
-
-            com.google.gson.JsonObject storedUsage = usage.deepCopy();
-            com.google.gson.JsonObject message = target.raw.getAsJsonObject("message");
-            message.add("usage", storedUsage);
-            target.raw.add("message", message);
-            target.raw.add("turnUsage", usage.deepCopy());
-
-            Double turnCostUsd = UsageCostCalculator.calculateTurnCostUsd(state.getProvider(), usage, state.getModel());
-            if (turnCostUsd != null) {
-                target.raw.addProperty("turnCostUsd", turnCostUsd);
-            }
-
-            int used = TokenUsageUtils.extractContextTokens(usage, state.getProvider());
-            if (used > 0) {
-                int fallbackMax = com.github.claudecodegui.handler.provider.ModelProviderHandler
-                        .resolveContextLimit(state.getProvider(), state.getModel(), state.getCwd());
-                int maxTokens = TokenUsageUtils.extractMaxTokens(usage, fallbackMax);
-                LOG.info("CLI [USAGE] context ring: used=" + used + " max=" + maxTokens
-                        + " model=" + state.getModel());
-                callbackHandler.notifyUsageUpdate(used, maxTokens);
-            }
+            assistantMessageObject(target.raw).add("usage", usage.deepCopy());
+            stampStepIntoTurnUsage(target, usage);
+            notifyContextUsageFromStep(usage);
             callbackHandler.notifyMessageUpdate(state.getMessages());
         } catch (Exception e) {
             LOG.debug("Usage marker parse skipped: " + e.getMessage());
         }
+    }
+
+    /**
+     * Add one step to the running turn total and keep it on a single message, so a
+     * turn whose steps land on different messages still shows one footer total.
+     */
+    private void stampStepIntoTurnUsage(Message target, com.google.gson.JsonObject stepUsage) {
+        stepTurnUsage.add(stepUsage);
+        if (stepTurnUsageTarget != null && stepTurnUsageTarget != target && stepTurnUsageTarget.raw != null) {
+            stepTurnUsageTarget.raw.remove("turnUsage");
+            stepTurnUsageTarget.raw.remove("turnCostUsd");
+        }
+        stepTurnUsageTarget = target;
+        target.raw.add("turnUsage", stepTurnUsage.snapshot());
+        Double turnCostUsd = stepTurnUsage.turnCostUsd(state.getProvider(), state.getModel());
+        if (turnCostUsd != null) {
+            target.raw.addProperty("turnCostUsd", turnCostUsd);
+        } else {
+            target.raw.remove("turnCostUsd");
+        }
+    }
+
+    private void notifyContextUsageFromStep(com.google.gson.JsonObject stepUsage) {
+        int used = TokenUsageUtils.extractContextTokens(stepUsage, state.getProvider());
+        if (used <= 0) {
+            return;
+        }
+        int fallbackMax = com.github.claudecodegui.handler.provider.ModelProviderHandler
+                .resolveContextLimit(state.getProvider(), state.getModel(), state.getCwd());
+        int maxTokens = TokenUsageUtils.extractMaxTokens(stepUsage, fallbackMax);
+        LOG.info("CLI [USAGE] context ring: used=" + used + " max=" + maxTokens
+                + " model=" + state.getModel());
+        callbackHandler.notifyUsageUpdate(used, maxTokens);
     }
 
     private static boolean hasPositiveDisplayableFigure(com.google.gson.JsonObject usage) {
@@ -695,28 +718,21 @@ public class CodexMessageHandler implements MessageCallback {
         };
         for (String key : displayableKeys) {
             JsonElement value = usage.get(key);
-            if (value != null && value.isJsonPrimitive() && value.getAsJsonPrimitive().isNumber()) {
-                if (value.getAsLong() > 0) {
-                    return true;
-                }
+            if (value != null && value.isJsonPrimitive() && value.getAsJsonPrimitive().isNumber()
+                    && value.getAsLong() > 0) {
+                return true;
             }
         }
         return false;
     }
 
-    private static void ensureAssistantMessageRaw(Message message) {
-        if (message.raw == null) {
-            com.google.gson.JsonObject raw = new com.google.gson.JsonObject();
-            raw.addProperty("type", "assistant");
+    private static com.google.gson.JsonObject assistantMessageObject(com.google.gson.JsonObject raw) {
+        if (!raw.has("message") || !raw.get("message").isJsonObject()) {
             com.google.gson.JsonObject messageObj = new com.google.gson.JsonObject();
             messageObj.add("content", new JsonArray());
             raw.add("message", messageObj);
-            message.raw = raw;
-        } else if (!message.raw.has("message") || !message.raw.get("message").isJsonObject()) {
-            com.google.gson.JsonObject messageObj = new com.google.gson.JsonObject();
-            messageObj.add("content", new JsonArray());
-            message.raw.add("message", messageObj);
         }
+        return raw.getAsJsonObject("message");
     }
 
     /**
@@ -1234,6 +1250,8 @@ public class CodexMessageHandler implements MessageCallback {
         isStreaming = true;
         streamEndedThisTurn = false;
         currentTurnContextUsage = null;
+        stepTurnUsage.reset();
+        stepTurnUsageTarget = null;
         resetStreamingAccumulator();
         callbackHandler.notifyStreamStart();
         LOG.debug("Codex stream started");

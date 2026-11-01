@@ -339,10 +339,91 @@ public class OpenCodeHistoryReaderTest {
         assertEquals(108, turnUsage.get("output_tokens").getAsInt());
         assertEquals(14189, turnUsage.get("cache_read_input_tokens").getAsInt());
         assertEquals(19117, turnUsage.get("total_tokens").getAsInt());
-        assertEquals(65536, turnUsage.get("model_context_window").getAsInt());
 
         JsonObject msgUsage = assistant.getAsJsonObject("message").getAsJsonObject("usage");
         assertEquals(19117, msgUsage.get("total_tokens").getAsInt());
         assertEquals(65536, msgUsage.get("model_context_window").getAsInt());
+    }
+
+    @Test
+    public void sumsStepsPerTurnAndNeverStampsAnotherTurn() throws Exception {
+        Path root = Files.createTempDirectory("oc-usage-turns");
+        Path storage = root.resolve("storage");
+        Files.createDirectories(storage);
+        Path db = root.resolve("opencode.db");
+        String sid = "ses_turns";
+        Class.forName("org.sqlite.JDBC");
+        try (Connection conn = DriverManager.getConnection("jdbc:sqlite:" + db.toAbsolutePath());
+             Statement st = conn.createStatement()) {
+            createOpenCodeTables(st);
+            st.execute("INSERT INTO session VALUES ('" + sid + "', '" + root + "', 't', 1, 2, null, 'build', null)");
+            insertMessage(st, sid, "m_u1", 10, "{\"role\":\"user\"}");
+            insertPart(st, sid, "m_u1", "p_u1", 10, "{\"type\":\"text\",\"text\":\"q1\"}");
+            // Turn 1: two steps (tool call, then answer), each its own OpenCode message.
+            insertMessage(st, sid, "m_a1", 11, assistantTokens(8725, 23, 0, 0.5));
+            insertPart(st, sid, "m_a1", "p_a1", 11,
+                    "{\"type\":\"tool\",\"callID\":\"c1\",\"tool\":\"read\",\"state\":{\"status\":\"completed\",\"input\":{},\"output\":\"ok\"}}");
+            insertMessage(st, sid, "m_a2", 12, assistantTokens(6723, 8, 2048, 0.25));
+            insertPart(st, sid, "m_a2", "p_a2", 12, "{\"type\":\"text\",\"text\":\"a1\"}");
+            insertMessage(st, sid, "m_u2", 20, "{\"role\":\"user\"}");
+            insertPart(st, sid, "m_u2", "p_u2", 20, "{\"type\":\"text\",\"text\":\"q2\"}");
+            // Turn 2: a step with tokens but nothing visible.
+            insertMessage(st, sid, "m_a3", 21, assistantTokens(5000, 0, 0, 0.0));
+            insertPart(st, sid, "m_a3", "p_a3", 21, "{\"type\":\"step-finish\"}");
+        }
+
+        List<JsonObject> messages = new OpenCodeHistoryReader(storage, db, new Gson())
+                .getSessionMessages(sid, root.toString());
+        JsonObject toolUse = firstAssistantWithBlock(messages, "tool_use");
+        JsonObject answer = messages.stream()
+                .filter(m -> "assistant".equals(m.get("type").getAsString()) && m.has("turnUsage"))
+                .findFirst().orElseThrow();
+
+        assertEquals(8725, toolUse.getAsJsonObject("message").getAsJsonObject("usage").get("input_tokens").getAsInt());
+        assertFalse(toolUse.has("turnUsage"));
+        JsonObject turnUsage = answer.getAsJsonObject("turnUsage");
+        assertEquals(8725 + 6723, turnUsage.get("input_tokens").getAsInt());
+        assertEquals(23 + 8, turnUsage.get("output_tokens").getAsInt());
+        assertEquals(2048, turnUsage.get("cache_read_input_tokens").getAsInt());
+        assertEquals(0.75, answer.get("turnCostUsd").getAsDouble(), 1e-9);
+        assertEquals(6723, answer.getAsJsonObject("message").getAsJsonObject("usage").get("input_tokens").getAsInt());
+        assertEquals(1, messages.stream().filter(m -> m.has("turnUsage")).count());
+    }
+
+    private static JsonObject firstAssistantWithBlock(List<JsonObject> messages, String blockType) {
+        for (JsonObject m : messages) {
+            if (!"assistant".equals(m.get("type").getAsString())) {
+                continue;
+            }
+            String first = m.getAsJsonObject("message").getAsJsonArray("content").get(0)
+                    .getAsJsonObject().get("type").getAsString();
+            if (blockType.equals(first)) {
+                return m;
+            }
+        }
+        throw new AssertionError("no assistant envelope with " + blockType);
+    }
+
+    private static String assistantTokens(int input, int output, int cacheRead, double cost) {
+        return "{\"role\":\"assistant\",\"cost\":" + cost + ",\"tokens\":{\"input\":" + input
+                + ",\"output\":" + output + ",\"reasoning\":0,\"cache\":{\"read\":" + cacheRead + ",\"write\":0}}}";
+    }
+
+    private static void createOpenCodeTables(Statement st) throws Exception {
+        st.execute("CREATE TABLE session (id text PRIMARY KEY, directory text NOT NULL, title text NOT NULL,"
+                + " time_created integer NOT NULL, time_updated integer NOT NULL, model text, agent text, parent_id text)");
+        st.execute("CREATE TABLE message (id text PRIMARY KEY, session_id text NOT NULL,"
+                + " time_created integer NOT NULL, data text NOT NULL)");
+        st.execute("CREATE TABLE part (id text PRIMARY KEY, message_id text NOT NULL, session_id text NOT NULL,"
+                + " time_created integer NOT NULL, data text NOT NULL)");
+    }
+
+    private static void insertMessage(Statement st, String sid, String id, int time, String data) throws Exception {
+        st.execute("INSERT INTO message VALUES ('" + id + "', '" + sid + "', " + time + ", '" + data + "')");
+    }
+
+    private static void insertPart(Statement st, String sid, String messageId, String id, int time, String data)
+            throws Exception {
+        st.execute("INSERT INTO part VALUES ('" + id + "', '" + messageId + "', '" + sid + "', " + time + ", '" + data + "')");
     }
 }

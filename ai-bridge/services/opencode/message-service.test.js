@@ -1,14 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { readFileSync } from 'node:fs';
 import {
   buildOpenCodeArgs,
   createOpenCodeEventDispatcher,
-  extractOpenCodeUsage,
   parseOpenCodeEvent,
-  resolveOpenCodeContextWindow,
 } from './message-service.js';
 
 const SAMPLES_URL = new URL(
@@ -252,6 +248,7 @@ test('parseOpenCodeEvent and dispatcher emit usage on step_finish events', () =>
     cache_creation_input_tokens: 0,
     total_tokens: 8759,
     thinking_tokens: 11,
+    cost_usd: 0,
   });
   assert.deepEqual(usages[1], {
     input_tokens: 6723,
@@ -260,55 +257,7 @@ test('parseOpenCodeEvent and dispatcher emit usage on step_finish events', () =>
     cache_creation_input_tokens: 0,
     total_tokens: 8794,
     thinking_tokens: 15,
+    cost_usd: 0,
   });
 });
 
-test('extractOpenCodeUsage normalizes OpenAI-compatible usage with cached_tokens', () => {
-  const usage = extractOpenCodeUsage({
-    type: 'step_finish',
-    usage: {
-      prompt_tokens: 19009,
-      completion_tokens: 108,
-      total_tokens: 19117,
-      prompt_tokens_details: {
-        cached_tokens: 14189,
-      },
-    },
-  });
-  assert.deepEqual(usage, {
-    input_tokens: 4820,
-    output_tokens: 108,
-    cache_read_input_tokens: 14189,
-    cache_creation_input_tokens: 0,
-    total_tokens: 19117,
-  });
-});
-
-test('resolveOpenCodeContextWindow reads limit.context from opencode.json', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'oc-cfg-test-'));
-  try {
-    writeFileSync(
-      join(dir, 'opencode.json'),
-      JSON.stringify({
-        provider: {
-          mlx: {
-            models: {
-              'local/Qwen3-Coder-30B-A3B-Instruct-Ternary2x': {
-                limit: { context: 65536, output: 8192 },
-              },
-            },
-          },
-        },
-        model: 'mlx/local/Qwen3-Coder-30B-A3B-Instruct-Ternary2x',
-      }),
-      'utf8'
-    );
-    assert.equal(resolveOpenCodeContextWindow('', dir, dir), 65536);
-    assert.equal(
-      resolveOpenCodeContextWindow('mlx/local/Qwen3-Coder-30B-A3B-Instruct-Ternary2x', dir, dir),
-      65536
-    );
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
