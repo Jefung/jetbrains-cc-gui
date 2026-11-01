@@ -20,9 +20,11 @@ final class ToolWindowStripeSupport {
         if (toolWindow.getAnchor() != ToolWindowAnchor.RIGHT) {
             toolWindow.setAnchor(ToolWindowAnchor.RIGHT, null);
         }
-        if (!toolWindow.isShowStripeButton()) {
-            toolWindow.setShowStripeButton(true);
+        // Reapplying an unchanged layout can disturb a live native browser on the client.
+        if (toolWindow.isShowStripeButton()) {
+            return;
         }
+        toolWindow.setShowStripeButton(true);
 
         // New UI ignores setShowStripeButton after init. Its dedicated operation also
         // publishes the layout event when the backend already believes the button is pinned.

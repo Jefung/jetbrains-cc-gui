@@ -15,7 +15,10 @@ import kotlin.jvm.functions.Function2;
 
 import java.lang.reflect.Proxy;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.Map;
+import java.util.Set;
+import java.util.WeakHashMap;
 
 /** Pins each remote client's launcher, including clients connected after project startup. */
 final class RemoteToolWindowStripeSupport {
@@ -24,6 +27,7 @@ final class RemoteToolWindowStripeSupport {
     private final ToolWindow window;
     private final ClassLoader loader;
     private final Class<?> sessionClass;
+    private final Set<Object> boundSessions = Collections.newSetFromMap(new WeakHashMap<>());
 
     private RemoteToolWindowStripeSupport(ToolWindowManager manager, ToolWindow window) throws ClassNotFoundException {
         this.manager = manager;
@@ -60,7 +64,8 @@ final class RemoteToolWindowStripeSupport {
                     default -> "CC GUI remote stripe listener";
                 };
             }
-            if (method.getName().equals("projectSessionInitialized")) {
+            if (method.getName().equals("beforeProjectSessionInitialized")
+                    || method.getName().equals("projectSessionInitialized")) {
                 bindLater(args[1]);
             }
             return null;
@@ -83,12 +88,15 @@ final class RemoteToolWindowStripeSupport {
 
     // Model registration can happen after the session event; view() covers existing and later entries.
     private void bindLater(Object session) {
-        manager.invokeLater(() -> {
+        Runnable bind = () -> {
             if (window.isDisposed() || window.getProject().isDisposed() || ((ComponentManager) session).isDisposed()) {
                 return;
             }
             try {
                 if (sessionClass.getMethod("getProject").invoke(session) != window.getProject()) {
+                    return;
+                }
+                if (!boundSessions.add(session)) {
                     return;
                 }
                 Object solution = loader.loadClass("com.jetbrains.rdserver.core.RemoteSessionKt")
@@ -113,40 +121,39 @@ final class RemoteToolWindowStripeSupport {
                 loader.loadClass("com.jetbrains.rd.util.reactive.IViewableMap")
                         .getMethod("view", lifetimeClass, Function2.class).invoke(entries, lifetime, onEntry);
             } catch (ReflectiveOperationException | RuntimeException e) {
+                boundSessions.remove(session);
                 LOG.warn("[ToolWindow] Could not bind the remote stripe model", e);
             }
-        });
+        };
+        // Install the observer before the IDE publishes the new session's window models.
+        if (ApplicationManager.getApplication().isDispatchThread()) {
+            bind.run();
+        } else {
+            manager.invokeLater(bind);
+        }
     }
 
-    // Remote generic factories are bundled and default to a hidden button in the new UI.
-    // Pin first, then refresh only a hidden launcher so the client actually creates its button.
+    // Initialize only a fresh model, before the IDE publishes its real availability.
+    // Changing an existing model's availability hides/reparents its native JCEF views.
     static void pinEntry(Map.Entry<?, ?> entry) {
         if (!ClaudeSDKToolWindow.TOOL_WINDOW_ID.equals(entry.getKey())) {
             return;
         }
         try {
             Object model = entry.getValue();
-            Object largeStripe = model.getClass().getMethod("isVisibleOnLargeStripe").invoke(model);
-            largeStripe.getClass().getMethod("set", Object.class).invoke(largeStripe, true);
+            Object available = model.getClass().getMethod("getAvailable").invoke(model);
+            if (available.getClass().getMethod("getValueOrNull").invoke(available) != null) {
+                return;
+            }
             Object toolWindow = model.getClass().getMethod("getToolWindow").invoke(model);
             Object state = toolWindow.getClass().getMethod("getState").invoke(toolWindow);
-            Object stateValue = state.getClass().getMethod("getValueOrNull").invoke(state);
-            if (stateValue != null && !"Hidden".equals(String.valueOf(stateValue))) {
+            if (state.getClass().getMethod("getValueOrNull").invoke(state) != null) {
                 return;
             }
-            Object available = model.getClass().getMethod("getAvailable").invoke(model);
-            Object original = available.getClass().getMethod("getValueOrNull").invoke(available);
-            if (Boolean.FALSE.equals(original)) {
-                return;
-            }
-            try {
-                available.getClass().getMethod("set", Object.class).invoke(available, false);
-            } finally {
-                // A newly added model has no availability yet; the IDE publishes its real value next.
-                if (Boolean.TRUE.equals(original)) {
-                    available.getClass().getMethod("set", Object.class).invoke(available, true);
-                }
-            }
+            Object largeStripe = model.getClass().getMethod("isVisibleOnLargeStripe").invoke(model);
+            largeStripe.getClass().getMethod("set", Object.class).invoke(largeStripe, true);
+            // The client must see the pinned flag before availability creates its stripe button.
+            available.getClass().getMethod("set", Object.class).invoke(available, false);
         } catch (NoSuchMethodException ignored) {
             LOG.debug("[ToolWindow] Remote new UI stripe properties are unavailable on this IDE build");
         } catch (ReflectiveOperationException | RuntimeException e) {

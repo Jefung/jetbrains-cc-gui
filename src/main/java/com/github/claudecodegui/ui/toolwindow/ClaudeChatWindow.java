@@ -1,6 +1,7 @@
 package com.github.claudecodegui.ui.toolwindow;
 
 import com.github.claudecodegui.action.SendShortcutSync;
+import com.github.claudecodegui.i18n.ClaudeCodeGuiBundle;
 import com.github.claudecodegui.handler.core.HandlerContext;
 import com.github.claudecodegui.handler.history.HistoryHandler;
 import com.github.claudecodegui.handler.core.MessageDispatcher;
@@ -139,6 +140,7 @@ public class ClaudeChatWindow {
     private final Map<SurfaceFrameFence.Attempt, SurfaceFrameFence.Attempt>
             surfaceDamageReplacementSources = new ConcurrentHashMap<>();
     private volatile int activePageGeneration;
+    private final WebviewRecoveryRequest webviewRecoveryRequest = new WebviewRecoveryRequest();
     private final HierarchyListener surfaceRefreshHierarchyListener = this::handleSurfaceRefreshHierarchyChange;
     private final ComponentAdapter surfaceRefreshComponentListener = new ComponentAdapter() {
         @Override
@@ -3318,6 +3320,63 @@ public class ClaudeChatWindow {
         executeJavaScriptCode("window.focusChatInput?.()");
     }
 
+    public boolean canRecoverCurrentView() {
+        return !disposed && frontendReady && browser != null && !webviewRecoveryRequest.isPending()
+                && webviewInitializer != null && webviewInitializer.canRecoverWebview();
+    }
+
+    /** A native IDE action remains usable when a client JCEF view stops painting but JS still runs. */
+    public void recoverCurrentView() {
+        if (!SwingUtilities.isEventDispatchThread()) {
+            ApplicationManager.getApplication().invokeLater(this::recoverCurrentView);
+            return;
+        }
+        if (!canRecoverCurrentView()) {
+            return;
+        }
+        String requestId = java.util.UUID.randomUUID().toString();
+        if (!webviewRecoveryRequest.begin(requestId, browser, activePageGeneration, recoveryNowMillis())) {
+            return;
+        }
+        if (!callJavaScript("window.prepareWebviewRecovery", JsUtils.escapeJs(requestId))) {
+            webviewRecoveryRequest.cancel();
+            reportViewRecoveryFailure();
+            return;
+        }
+        surfaceRefreshAlarm.addRequest(() -> {
+            if (webviewRecoveryRequest.expire(requestId, recoveryNowMillis()) && !disposed) {
+                callJavaScript("window.cancelWebviewRecovery", JsUtils.escapeJs(requestId));
+                reportViewRecoveryFailure();
+            }
+        }, (int) WebviewRecoveryRequest.TIMEOUT_MS);
+    }
+
+    // Only a verified checkpoint for this exact page can replace its browser; SDK/session stay live.
+    private void onWebviewRecoveryPrepared(String requestId, boolean success) {
+        ApplicationManager.getApplication().invokeLater(() -> {
+            if (disposed || !webviewRecoveryRequest.accept(
+                    requestId, browser, activePageGeneration, recoveryNowMillis())) {
+                return;
+            }
+            if (!success || !webviewInitializer.canRecoverWebview()) {
+                callJavaScript("window.cancelWebviewRecovery", JsUtils.escapeJs(requestId));
+                reportViewRecoveryFailure();
+                return;
+            }
+            webviewInitializer.recreateWebview("native_recovery_action");
+        });
+    }
+
+    private void reportViewRecoveryFailure() {
+        com.github.claudecodegui.notifications.ClaudeNotifier.showWarning(project,
+                ClaudeCodeGuiBundle.message("action.recoverView.failed"));
+    }
+
+    // A wall-clock adjustment must not leave the native action permanently waiting for an ack.
+    private static long recoveryNowMillis() {
+        return TimeUnit.NANOSECONDS.toMillis(System.nanoTime());
+    }
+
     // ==================== Dispose ====================
 
     public void dispose() {
@@ -3330,6 +3389,7 @@ public class ClaudeChatWindow {
             return;
         }
         this.disposed = true;
+        webviewRecoveryRequest.cancel();
         JBCefBrowser targetBrowser = this.browser;
         try {
             disposeWindowResources();
@@ -3598,6 +3658,7 @@ public class ClaudeChatWindow {
                 // Keep both pages out of dispatch until the identity and delivery baselines agree.
                 boolean activated = dispatchGate.activatePageGeneration(pageGeneration, () -> {
                     if (generationChanged) {
+                        webviewRecoveryRequest.cancel();
                         surfaceRefreshCoordinator.invalidate();
                         cancelScheduledOsrSurfaceRefresh();
                         activePageGeneration = pageGeneration;
@@ -3895,6 +3956,11 @@ public class ClaudeChatWindow {
             @Override
             public void onSurfaceDamageApplied(String token, String phase, boolean applied) {
                 ClaudeChatWindow.this.onSurfaceDamageApplied(token, phase, applied);
+            }
+
+            @Override
+            public void onWebviewRecoveryPrepared(String requestId, boolean success) {
+                ClaudeChatWindow.this.onWebviewRecoveryPrepared(requestId, success);
             }
 
             @Override

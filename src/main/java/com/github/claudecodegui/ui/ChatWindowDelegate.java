@@ -134,6 +134,8 @@ public class ChatWindowDelegate {
         void setFrontendReady(boolean ready);
         void onHistoryRenderComplete(long commitEpoch);
         void onSurfaceDamageApplied(String token, String phase, boolean applied);
+        default void onWebviewRecoveryPrepared(String requestId, boolean success) {
+        }
         void setSlashCommandsFetched(boolean fetched);
         void setFetchedSlashCommandsCount(int count);
         void persistTabSessionState();
@@ -539,6 +541,9 @@ public class ChatWindowDelegate {
             }
             @Override public void onRefreshSlashCommands() {
                 host.getSessionLifecycleManager().fetchSlashCommandsOnStartup();
+            }
+            @Override public void onWebviewRecoveryPrepared(String requestId, boolean success) {
+                host.onWebviewRecoveryPrepared(requestId, success);
             }
         }));
 

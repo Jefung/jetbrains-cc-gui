@@ -224,11 +224,10 @@ public class ClaudeSDKToolWindow implements ToolWindowFactory, DumbAware {
         // During init this updates the saved layout directly, including in the new UI.
         toolWindow.setShowStripeButton(true);
         ToolWindowManager manager = ToolWindowManager.getInstance(toolWindow.getProject());
+        // Observe model creation before the registration event can expose this window to the client.
+        RemoteToolWindowStripeSupport.install(manager, toolWindow);
         // Anchor changes require a registered entry; do not open the chat just to pin its button.
-        manager.invokeLater(() -> {
-            ToolWindowStripeSupport.pinToRight(manager, toolWindow);
-            RemoteToolWindowStripeSupport.install(manager, toolWindow);
-        });
+        manager.invokeLater(() -> ToolWindowStripeSupport.pinToRight(manager, toolWindow));
     }
 
     @Override
@@ -329,6 +328,13 @@ public class ClaudeSDKToolWindow implements ToolWindowFactory, DumbAware {
         }
         if (createFromTemplateAction != null) {
             gearActions.add(createFromTemplateAction);
+        }
+        com.intellij.openapi.actionSystem.AnAction recoverViewAction =
+                com.intellij.openapi.actionSystem.ActionManager.getInstance()
+                        .getAction("ClaudeCodeGUI.RecoverViewAction");
+        if (recoverViewAction != null) {
+            gearActions.addSeparator();
+            gearActions.add(recoverViewAction);
         }
         toolWindow.setAdditionalGearActions(gearActions);
 

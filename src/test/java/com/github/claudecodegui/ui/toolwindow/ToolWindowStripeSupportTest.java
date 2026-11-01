@@ -124,14 +124,14 @@ public class ToolWindowStripeSupportTest {
     }
 
     @Test
-    public void backendPinnedStateStillPublishesNewUILayoutUpdate() {
+    public void alreadyPinnedBackendDoesNotRepublishTheClientLayout() {
         Fixture f = new Fixture(true);
         f.anchor = ToolWindowAnchor.RIGHT;
         f.stripe = true;
         f.restore();
         assertEquals(0, f.anchorChanges);
         assertEquals(0, f.stripeChanges);
-        assertEquals(1, ((NewUIManager) f.manager).updates);
+        assertEquals(0, ((NewUIManager) f.manager).updates);
     }
 
     @Test

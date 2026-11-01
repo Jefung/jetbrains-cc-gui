@@ -24,14 +24,14 @@ public class RemoteToolWindowStripeSupportTest {
     }
 
     public static final class WindowModel {
-        final Property state = new Property("Hidden");
+        final Property state = new Property(null);
         public Property getState() { return state; }
     }
 
     /** The client registers a bundled generic factory with no initial stripe button. */
     public static final class RemoteModel {
         final Property large = new Property(null);
-        final Property available = new Property(true);
+        final Property available = new Property(null);
         final WindowModel window = new WindowModel();
         boolean frontendAvailable = true;
         boolean pinned;
@@ -51,39 +51,50 @@ public class RemoteToolWindowStripeSupportTest {
     }
 
     @Test
-    public void hiddenGenericLauncherCreatesAButtonAfterPinning() {
+    public void freshModelIsPinnedBeforeIDEAvailabilityCreatesTheButton() {
         RemoteModel model = new RemoteModel();
         model.pin();
         assertTrue(model.pinned);
-        assertTrue(model.buttonCreated);
+        assertFalse(model.frontendAvailable);
+        assertFalse(model.buttonCreated);
+        assertEquals(List.of(false), model.available.updates);
+        model.available.set(true);
         assertTrue(model.frontendAvailable);
-        assertEquals(List.of(false, true), model.available.updates);
-        assertEquals("Hidden", model.window.state.value);
+        assertTrue(model.buttonCreated);
         assertTrue(model.window.state.updates.isEmpty());
     }
 
     @Test
-    public void newProjectModelWaitsForIDEToPublishItsRealAvailability() {
+    public void hiddenExistingBrowserIsNeverDetachedToRepairItsLauncher() {
         RemoteModel model = new RemoteModel();
-        model.available.value = null;
-        model.window.state.value = null;
+        model.available.value = true;
+        model.window.state.value = "Hidden";
         model.pin();
-        assertEquals(List.of(false), model.available.updates);
-        assertFalse(model.buttonCreated);
-        model.available.set(true);
-        assertTrue(model.buttonCreated);
+        assertTrue(model.large.updates.isEmpty());
+        assertTrue(model.available.updates.isEmpty());
+        assertTrue(model.window.state.updates.isEmpty());
     }
 
     @Test
-    public void visibleChatIsPinnedWithoutHidingOrRebuildingIt() {
+    public void visibleChatHasNoLayoutOrAvailabilityChanges() {
         for (String state : List.of("Active", "ActiveAndFocused")) {
             RemoteModel model = new RemoteModel();
+            model.available.value = true;
             model.window.state.value = state;
             model.pin();
-            assertTrue(model.pinned);
+            assertTrue(model.large.updates.isEmpty());
             assertTrue(model.available.updates.isEmpty());
             assertTrue(model.window.state.updates.isEmpty());
         }
+    }
+
+    @Test
+    public void aRestoredClientStateIsNotTreatedAsAFreshModel() {
+        RemoteModel model = new RemoteModel();
+        model.window.state.value = "Hidden";
+        model.pin();
+        assertTrue(model.large.updates.isEmpty());
+        assertTrue(model.available.updates.isEmpty());
     }
 
     @Test
@@ -91,8 +102,8 @@ public class RemoteToolWindowStripeSupportTest {
         RemoteModel model = new RemoteModel();
         model.available.value = false;
         model.pin();
-        assertTrue(model.pinned);
         assertEquals(false, model.available.value);
+        assertTrue(model.large.updates.isEmpty());
         assertTrue(model.available.updates.isEmpty());
     }
 
@@ -102,14 +113,17 @@ public class RemoteToolWindowStripeSupportTest {
     }
 
     @Test
-    public void reconnectWithANewModelRestoresTheNewLauncher() {
-        RemoteModel first = new RemoteModel();
-        first.pin();
+    public void reconnectInitializesOnlyTheNewModel() {
+        RemoteModel old = new RemoteModel();
+        old.available.value = true;
+        old.window.state.value = "Active";
+        old.pin();
         RemoteModel reconnected = new RemoteModel();
         reconnected.pin();
-        assertTrue(first.buttonCreated);
+        reconnected.available.set(true);
+        assertTrue(old.large.updates.isEmpty());
+        assertTrue(old.available.updates.isEmpty());
         assertTrue(reconnected.buttonCreated);
-        assertEquals(List.of(false, true), reconnected.available.updates);
     }
 
     @Test
