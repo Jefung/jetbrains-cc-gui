@@ -132,6 +132,9 @@ public class ChatWindowDelegate {
         void setSlashCommandsFetched(boolean fetched);
         void setFetchedSlashCommandsCount(int count);
         void persistTabSessionState();
+        void loadRestoredHistoryManually();
+        void cancelRestoredHistoryLoad(String requestId);
+        void retireRestoredHistory();
 
         /**
          * Soft-reload the currently active session's transcript without interrupting
@@ -470,6 +473,22 @@ public class ChatWindowDelegate {
                 host.reloadActiveSessionMessages();
             } else {
                 host.getSessionLifecycleManager().loadHistorySession(sessionId, projectPath, provider, model);
+            }
+        });
+        historyHandler.setRestoredHistoryCallback(new HistoryHandler.RestoredHistoryCallback() {
+            @Override
+            public void onLoad() {
+                host.loadRestoredHistoryManually();
+            }
+
+            @Override
+            public void onCancel(String requestId) {
+                host.cancelRestoredHistoryLoad(requestId);
+            }
+
+            @Override
+            public void onCodexSessionSelected() {
+                host.retireRestoredHistory();
             }
         });
         host.setHistoryHandler(historyHandler);
