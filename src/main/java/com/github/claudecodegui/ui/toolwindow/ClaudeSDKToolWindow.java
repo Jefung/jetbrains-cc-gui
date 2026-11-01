@@ -221,6 +221,14 @@ public class ClaudeSDKToolWindow implements ToolWindowFactory, DumbAware {
     public void init(@NotNull ToolWindow toolWindow) {
         toolWindow.setTitle(TOOL_WINDOW_DISPLAY_NAME);
         toolWindow.setStripeTitle(TOOL_WINDOW_DISPLAY_NAME);
+        // During init this updates the saved layout directly, including in the new UI.
+        toolWindow.setShowStripeButton(true);
+        ToolWindowManager manager = ToolWindowManager.getInstance(toolWindow.getProject());
+        // Anchor changes require a registered entry; do not open the chat just to pin its button.
+        manager.invokeLater(() -> {
+            ToolWindowStripeSupport.pinToRight(manager, toolWindow);
+            RemoteToolWindowStripeSupport.install(manager, toolWindow);
+        });
     }
 
     @Override
