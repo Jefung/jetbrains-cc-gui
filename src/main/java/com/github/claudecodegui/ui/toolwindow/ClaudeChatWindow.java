@@ -30,6 +30,7 @@ import com.github.claudecodegui.settings.CodemossSettingsService;
 import com.github.claudecodegui.settings.TabStateService;
 import com.intellij.util.concurrency.AppExecutorUtil;
 import com.github.claudecodegui.ui.ChatWindowDelegate;
+import com.github.claudecodegui.ui.DraftCacheKeys;
 import com.github.claudecodegui.ui.EditorContextTracker;
 import com.github.claudecodegui.ui.SurfaceFrameFence;
 import com.github.claudecodegui.ui.WebviewInitializer;
@@ -107,6 +108,7 @@ public class ClaudeChatWindow {
     // the bridges actually route permission requests to.
     private String permissionServiceKey = null;
     private boolean permissionServiceDisposed = false;
+    private String draftCacheKey = null;
 
     private volatile JBCefBrowser browser;
     // volatile: read from the daemon reader thread by the session_updated listener
@@ -343,6 +345,8 @@ public class ClaudeChatWindow {
             ClaudeSession owner = current.session;
             return owner == null ? null : owner.getState().currentExecutionOwnership();
         });
+        this.draftCacheKey = DraftCacheKeys.getInstance().register(
+                project.getLocationHash(), permissionServiceKey, this::requestClosedDraftPrune);
 
         this.sessionLifecycleManager = new SessionLifecycleManager(new SessionLifecycleManager.SessionHost() {
             @Override
@@ -532,6 +536,7 @@ public class ClaudeChatWindow {
             }
 
             persistTabSessionState();
+            chatWindowDelegate.refreshUnreadBadge();
         }
     }
 
@@ -548,6 +553,23 @@ public class ClaudeChatWindow {
 
     public boolean isInitialized() {
         return initialWebviewStartup.hasStarted();
+    }
+
+    /** Let the visible tab finish restoring history before background work competes with it. */
+    boolean isReadyForBackgroundPreload() {
+        return frontendReady && (session == null || !session.isLoading());
+    }
+
+    /**
+     * Warm a restored page without selecting the tab or starting an AI turn. Its history loads when
+     * the page reports ready, which honours the startup-history setting and shows the load state.
+     */
+    void preloadRestoredTab() {
+        if (disposed || project.isDisposed()) {
+            return;
+        }
+        ensureWebviewInitialized();
+        loadRestoredHistoryIfNeeded();
     }
 
     private void ensureWebviewInitialized() {
@@ -688,6 +710,7 @@ public class ClaudeChatWindow {
                 return;
             }
             ensureWebviewInitialized(false);
+            chatWindowDelegate.markTabReadIfVisible();
             webviewWatchdog.markTabActivated();
             webviewInitializer.onTabActivated();
             JBCefBrowser currentBrowser = browser;
@@ -1329,6 +1352,7 @@ public class ClaudeChatWindow {
         }
         rebindSurfaceRefreshWindow();
         if (mainPanel.isShowing()) {
+            chatWindowDelegate.markTabReadIfVisible();
             ensureWebviewInitialized(false);
             resumePendingSurfaceWork("hierarchy_showing");
         }
@@ -1668,6 +1692,7 @@ public class ClaudeChatWindow {
         session.setSessionInfo(restoredSessionId, restoredCwd);
         restoredHistory.bind(session, restoredSessionId);
         restoredHistoryLoadState = null;
+        chatWindowDelegate.restoreUnread(sameProject && savedState.unread);
         persistTabSessionState();
 
         LOG.info("[TabRestore] Restored tab session state: provider=" + savedState.provider
@@ -1986,6 +2011,12 @@ public class ClaudeChatWindow {
         LOG.debug("[WebviewTransport] Requested full transcript replay: reason=" + reason);
     }
 
+    /** Lets this page delete persisted drafts of closed windows; false if it cannot run now. */
+    private boolean requestClosedDraftPrune(String openWindowsJson) {
+        return !disposed && frontendReady
+                && callJavaScript("window.pruneClosedDrafts", JsUtils.escapeJs(openWindowsJson));
+    }
+
     private void updateFrontendReadyState(boolean ready) {
         FrontendReadyTransition transition = frontendReadyTransitions.update(ready);
         frontendReady = ready;
@@ -1996,6 +2027,7 @@ public class ClaudeChatWindow {
         }
         hasEverBeenFrontendReady = true;
         webviewEventQueue.readyChanged();
+        requestClosedDraftPrune(DraftCacheKeys.getInstance().openWindowsJson());
         flushPendingSelectionContext();
         flushPendingCodeSnippet();
         flushPendingFileReferences();
@@ -2685,6 +2717,13 @@ public class ClaudeChatWindow {
                 streamCoalescer,
                 new SessionCallbackAdapter.JsTarget() {
                     @Override
+                    public void onAssistantActivity() {
+                        if (!disposed && session == callbackSession) {
+                            chatWindowDelegate.onAssistantActivity();
+                        }
+                    }
+
+                    @Override
                     public void callJavaScript(String functionName, String... args) {
                         ClaudeChatWindow.this.callJavaScript(functionName, args);
                     }
@@ -3190,6 +3229,7 @@ public class ClaudeChatWindow {
         snapshot.model = session.getModel();
         snapshot.permissionMode = session.getPermissionMode();
         snapshot.reasoningEffort = session.getReasoningEffort();
+        snapshot.unread = chatWindowDelegate.hasUnread();
 
         TabStateService.getInstance(project).saveTabSessionState(tabIndex, snapshot);
     }
@@ -3301,6 +3341,12 @@ public class ClaudeChatWindow {
                 handlerContext.setBrowser(null);
             }
             disposePermissionService();
+            try {
+                // Other pages may now delete this window's persisted draft.
+                DraftCacheKeys.getInstance().unregister(this.draftCacheKey);
+            } catch (Exception | LinkageError error) {
+                LOG.warn("Failed to release the draft cache key", error);
+            }
             try {
                 webviewWatchdog.stop();
             } catch (Exception | LinkageError error) {
@@ -3513,7 +3559,7 @@ public class ClaudeChatWindow {
 
             @Override
             public String getDraftCacheKey() {
-                return project.getLocationHash() + ":" + permissionServiceKey;
+                return draftCacheKey;
             }
 
             @Override
