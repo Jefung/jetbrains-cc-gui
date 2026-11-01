@@ -349,6 +349,7 @@ public class OpenCodeHistoryReader {
 
     private List<JsonObject> getSessionMessagesFromDatabase(
             String sessionId,
+            String cwd,
             BooleanSupplier cancellation
     ) {
         List<JsonObject> out = new ArrayList<>();
@@ -359,6 +360,7 @@ public class OpenCodeHistoryReader {
             if (conn == null || !tableExists(conn, "message")) {
                 return out;
             }
+            String effectiveCwd = (cwd != null && !cwd.isBlank()) ? cwd : readSessionDirectoryFromDb(conn, sessionId.trim());
             String sql = """
                     SELECT id, data, time_created
                     FROM message
@@ -369,6 +371,7 @@ public class OpenCodeHistoryReader {
                 ps.setString(1, sessionId.trim());
                 try (ResultSet rs = ps.executeQuery()) {
                     int counter = 0;
+                    OpenCodeHistoryUsage historyUsage = new OpenCodeHistoryUsage(effectiveCwd);
                     while (rs.next()) {
                         HistoryCancellation.check(cancellation);
                         String messageId = rs.getString("id");
@@ -389,6 +392,7 @@ public class OpenCodeHistoryReader {
                                 continue;
                             }
                             counter++;
+                            historyUsage.finishTurn();
                             out.add(buildUserTextMessage(body, messageId != null ? messageId : "oc-user-" + counter));
                         } else if ("assistant".equals(role)) {
                             List<JsonObject> converted = convertAssistantParts(
@@ -398,8 +402,10 @@ public class OpenCodeHistoryReader {
                             );
                             counter += converted.size();
                             out.addAll(converted);
+                            historyUsage.onAssistantMessage(msg, parts, converted);
                         }
                     }
+                    historyUsage.finishTurn();
                 }
             }
         } catch (CancellationException e) {
@@ -408,6 +414,24 @@ public class OpenCodeHistoryReader {
             LOG.warn("[OpenCodeHistoryReader] SQLite messages failed for " + sessionId + ": " + e.getMessage());
         }
         return out;
+    }
+
+    private String readSessionDirectoryFromDb(Connection conn, String sessionId) {
+        try {
+            if (!tableExists(conn, "session")) {
+                return null;
+            }
+            try (PreparedStatement ps = conn.prepareStatement("SELECT directory FROM session WHERE id = ? LIMIT 1")) {
+                ps.setString(1, sessionId);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (rs.next()) {
+                        return blankToNull(rs.getString("directory"));
+                    }
+                }
+            }
+        } catch (SQLException ignored) {
+        }
+        return null;
     }
 
     private List<JsonObject> loadPartsFromDb(Connection conn, String messageId) throws SQLException {
@@ -650,15 +674,16 @@ public class OpenCodeHistoryReader {
             return List.of();
         }
         // Prefer SQLite rows (OpenCode 1.x). Fall back to legacy JSON tree.
-        List<JsonObject> fromDb = getSessionMessagesFromDatabase(sessionId, cancellation);
+        List<JsonObject> fromDb = getSessionMessagesFromDatabase(sessionId, cwd, cancellation);
         if (!fromDb.isEmpty()) {
             return fromDb;
         }
-        return getSessionMessagesFromJsonStorage(sessionId, cancellation);
+        return getSessionMessagesFromJsonStorage(sessionId, cwd, cancellation);
     }
 
     private List<JsonObject> getSessionMessagesFromJsonStorage(
             String sessionId,
+            String cwd,
             BooleanSupplier cancellation
     ) throws IOException {
         Path msgDir = storageRoot.resolve("message").resolve(sessionId.trim());
@@ -680,6 +705,7 @@ public class OpenCodeHistoryReader {
 
         List<JsonObject> out = new ArrayList<>();
         int counter = 0;
+        OpenCodeHistoryUsage historyUsage = new OpenCodeHistoryUsage(cwd);
         for (Path file : files) {
             HistoryCancellation.check(cancellation);
             JsonObject msg;
@@ -701,13 +727,17 @@ public class OpenCodeHistoryReader {
                     continue;
                 }
                 counter++;
+                historyUsage.finishTurn();
                 out.add(buildUserTextMessage(body, messageId != null ? messageId : "oc-user-" + counter));
             } else if ("assistant".equals(role)) {
-                List<JsonObject> converted = convertAssistantParts(messageId, counter, loadPartsFromJson(messageId));
+                List<JsonObject> parts = loadPartsFromJson(messageId);
+                List<JsonObject> converted = convertAssistantParts(messageId, counter, parts);
                 counter += converted.size();
                 out.addAll(converted);
+                historyUsage.onAssistantMessage(msg, parts, converted);
             }
         }
+        historyUsage.finishTurn();
         return out;
     }
 
