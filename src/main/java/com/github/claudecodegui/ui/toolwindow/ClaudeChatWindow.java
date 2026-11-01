@@ -29,6 +29,7 @@ import com.github.claudecodegui.session.StreamMessageCoalescer;
 import com.github.claudecodegui.settings.CodemossSettingsService;
 import com.github.claudecodegui.settings.TabStateService;
 import com.github.claudecodegui.ui.ChatWindowDelegate;
+import com.github.claudecodegui.ui.DraftCacheKeys;
 import com.github.claudecodegui.ui.EditorContextTracker;
 import com.github.claudecodegui.ui.SurfaceFrameFence;
 import com.github.claudecodegui.ui.WebviewInitializer;
@@ -101,6 +102,7 @@ public class ClaudeChatWindow {
     // clearPermissionDecisionMemory(), both of which must reach the instance
     // the bridges actually route permission requests to.
     private String permissionServiceKey = null;
+    private String draftCacheKey = null;
 
     private volatile JBCefBrowser browser;
     // volatile: read from the daemon reader thread by the session_updated listener
@@ -322,6 +324,8 @@ public class ClaudeChatWindow {
         chatWindowDelegate.initializeHandlers();
         this.permissionServiceKey = chatWindowDelegate.setupPermissionService();
         this.sessionId = this.permissionServiceKey;
+        this.draftCacheKey = DraftCacheKeys.getInstance().register(
+                project.getLocationHash(), permissionServiceKey, this::requestClosedDraftPrune);
 
         this.sessionLifecycleManager = new SessionLifecycleManager(new SessionLifecycleManager.SessionHost() {
             @Override
@@ -1771,6 +1775,12 @@ public class ClaudeChatWindow {
         LOG.debug("[WebviewTransport] Requested full transcript replay: reason=" + reason);
     }
 
+    /** Lets this page delete persisted drafts of closed windows; false if it cannot run now. */
+    private boolean requestClosedDraftPrune(String openWindowsJson) {
+        return !disposed && frontendReady
+                && callJavaScript("window.pruneClosedDrafts", JsUtils.escapeJs(openWindowsJson));
+    }
+
     private void updateFrontendReadyState(boolean ready) {
         FrontendReadyTransition transition = frontendReadyTransitions.update(ready);
         frontendReady = ready;
@@ -1781,6 +1791,7 @@ public class ClaudeChatWindow {
         }
         hasEverBeenFrontendReady = true;
         webviewEventQueue.readyChanged();
+        requestClosedDraftPrune(DraftCacheKeys.getInstance().openWindowsJson());
         flushPendingCodeSnippet();
         flushPendingFileReferences();
         // No transcript replay here: the only caller that passes true is
@@ -3133,6 +3144,12 @@ public class ClaudeChatWindow {
         }
 
         try {
+            DraftCacheKeys.getInstance().unregister(this.draftCacheKey);
+        } catch (Exception e) {
+            LOG.warn("Failed to release the draft cache key: " + e.getMessage());
+        }
+
+        try {
             if (this.permissionServiceKey != null && !this.permissionServiceKey.isEmpty()) {
                 PermissionService permissionService = PermissionService.getInstance(project, this.permissionServiceKey);
                 permissionService.unregisterDialogShower(project);
@@ -3245,7 +3262,7 @@ public class ClaudeChatWindow {
 
             @Override
             public String getDraftCacheKey() {
-                return project.getLocationHash() + ":" + permissionServiceKey;
+                return draftCacheKey;
             }
 
             @Override

@@ -34,6 +34,44 @@ public class WebviewWatchdogTest {
         assertFalse(watchdog.handleHeartbeat(null));
     }
 
+    /** A hidden page's throttled timers must not replay the transcript on every heartbeat. */
+    @Test
+    public void defersHiddenPageResumeUntilVisible() {
+        AtomicLong now = new AtomicLong(1_000L);
+        WebviewWatchdog watchdog = createWatchdog(
+                new ShowingPanel(true), now, new AtomicInteger(), new AtomicInteger(), Runnable::run);
+        for (int minute = 0; minute < 3; minute++) {
+            now.addAndGet(60_000L);
+            assertFalse(watchdog.handleHeartbeat("{\"visibility\":\"hidden\"}"));
+        }
+
+        now.addAndGet(5_000L);
+        assertTrue(watchdog.handleHeartbeat("{\"visibility\":\"visible\"}"));
+        now.addAndGet(5_000L);
+        assertFalse(watchdog.handleHeartbeat("{\"visibility\":\"visible\"}"));
+    }
+
+    /** Gaps on a congested transport share one replay per interval, and the last is not lost. */
+    @Test
+    public void reconcilesRepeatedGapsAtMostOncePerInterval() {
+        AtomicLong now = new AtomicLong(1_000L);
+        WebviewWatchdog watchdog = createWatchdog(
+                new ShowingPanel(true), now, new AtomicInteger(), new AtomicInteger(), Runnable::run);
+        now.set(21_000L);
+        assertTrue(watchdog.handleHeartbeat(null));
+        now.set(41_000L);
+        assertFalse(watchdog.handleHeartbeat(null));
+        for (long time = 46_000L; time < 81_000L; time += 5_000L) {
+            now.set(time);
+            assertFalse(watchdog.handleHeartbeat(null));
+        }
+
+        now.set(81_000L);
+        assertTrue(watchdog.handleHeartbeat(null));
+        now.set(86_000L);
+        assertFalse(watchdog.handleHeartbeat(null));
+    }
+
     /** Client clocks must not make a healthy remote renderer look stalled. */
     @Test
     public void measuresRenderAgeOnTheClientClock() {

@@ -5,11 +5,22 @@ import type { ProviderManageTab } from '../components/settings/ProviderTabSectio
 import type { ContextInfo, ViewMode } from '../hooks';
 import { DEFAULT_STATUS } from './MessagesContext';
 import { forceWebviewRepaint } from '../utils/forceWebviewRepaint';
-import { draftCacheKey, mirrorDraft, pruneDrafts, readDraft, writeDraft } from './draftStorage';
+import {
+  draftCacheKey, mirrorDraft, pruneDrafts, readDraft, readSessionDraft, writeDraft,
+} from './draftStorage';
 
 const DRAFT_SAVE_DEBOUNCE_MS = 200;
 /** A stalled browser storage backend must not keep the whole chat blank. */
 const DRAFT_RESTORE_TIMEOUT_MS = 1000;
+
+let resolveChatMounted: () => void = () => {};
+/**
+ * Resolves after the chat tree, which waits for the draft restore, has mounted. Java replays the
+ * session on frontend_ready, and some of its callbacks (stream start) have no pre-mount buffer.
+ */
+export const chatMounted = new Promise<void>((resolve) => {
+  resolveChatMounted = resolve;
+});
 
 export interface UIStateContextValue {
   // Navigation
@@ -94,7 +105,7 @@ export function UIStateProvider({ children }: { children: ReactNode }) {
       }
       setDraftReady(true);
     };
-    timer = window.setTimeout(() => finish(''), DRAFT_RESTORE_TIMEOUT_MS);
+    timer = window.setTimeout(() => finish(readSessionDraft()), DRAFT_RESTORE_TIMEOUT_MS);
     void readDraft().then(finish);
     void pruneDrafts();
     return () => {
@@ -102,6 +113,10 @@ export function UIStateProvider({ children }: { children: ReactNode }) {
       window.clearTimeout(timer);
     };
   }, []);
+  useEffect(() => {
+    // Child effects of the same commit, including the Java callbacks, have already run.
+    if (draftReady) resolveChatMounted();
+  }, [draftReady]);
   useEffect(() => {
     if (!draftReady || !draftDirtyRef.current) return;
     const timer = window.setTimeout(() => void writeDraft(draftInput), DRAFT_SAVE_DEBOUNCE_MS);
